@@ -3,10 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Wario Synthesis Engine 8-Bit Midi</title>
+    <title>Wario Synth v1.5 "Tony Destin Fork"</title>
 
     <!-- OpenGraph / Social Media Preview -->
-    <meta property="og:title" content="Wario Synthesis Engine 8-Bit Midi">
+    <meta property="og:title" content="Wario Synth v1.5 &quot;Tony Destin Fork&quot;">
     <meta property="og:description" content="Turn any song into a Game Boy version">
     <meta property="og:image" content="/warioX.png">
     <meta property="og:image:width" content="1472">
@@ -16,7 +16,7 @@
 
     <!-- Twitter Card -->
     <meta name="twitter:card" content="summary_large_image">
-    <meta name="twitter:title" content="Wario Synthesis Engine 8-Bit Midi">
+    <meta name="twitter:title" content="Wario Synth v1.5 &quot;Tony Destin Fork&quot;">
     <meta name="twitter:description" content="Turn any song into a Game Boy version">
     <meta name="twitter:image" content="/warioX.png">
 
@@ -1089,6 +1089,58 @@
             font-size: 8px;
             width: 100%;
         }
+        .lightweight-setting {
+            display: flex;
+            align-items: center;
+            margin-top: 10px;
+            color: var(--gb-darkest);
+        }
+        .lightweight-setting label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 8px;
+            cursor: pointer;
+        }
+        .lightweight-setting span {
+            font-size: 7px;
+            color: var(--gb-dark);
+        }
+
+        .audio-import {
+            margin-top: calc(var(--spacing-unit) * 2);
+            padding: calc(var(--spacing-unit) * 2);
+            border: 2px dashed var(--gb-medium);
+            background: var(--gb-lightest);
+        }
+        .audio-import-title {
+            margin: 0 0 10px;
+            font-size: 9px;
+            color: var(--gb-darkest);
+        }
+        .audio-import-row {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .audio-import-row input[type="text"] {
+            flex: 1;
+            min-width: 240px;
+        }
+        .audio-import-row select {
+            background: var(--gb-lightest);
+            color: var(--gb-darkest);
+            border: 2px solid var(--gb-dark);
+            padding: 8px 10px;
+            font-family: 'Press Start 2P', monospace;
+            font-size: 8px;
+        }
+        .audio-import-note {
+            margin: 10px 0 0;
+            color: var(--gb-dark);
+            font-size: 8px;
+            line-height: 1.7;
+        }
 
         /* Mobile: increase font sizes for readability */
         @media (max-width: 640px) {
@@ -1141,7 +1193,7 @@
     <div class="container">
         <div class="hero">
             <div class="hero-top">
-                <h1>WARIO SYNTH <span class="version-tag">v1.5</span></h1>
+                <h1>WARIO SYNTH <span class="version-tag">v1.5 "TONY DESTIN FORK"</span></h1>
                 <button id="faqBtnTop" class="faq-link" type="button">FAQ</button>
             </div>
         </div>
@@ -1149,6 +1201,33 @@
         <div class="controls">
             <input type="text" id="songInput" placeholder="Search for a song…" />
             <button id="searchBtn" class="primary">Search</button>
+        </div>
+
+        <div class="audio-import">
+            <p class="audio-import-title">NO MIDI? TRANSCRIBE AUDIO</p>
+            <div class="audio-import-row">
+                <select id="transcriptionMode" aria-label="Transcription mode">
+                    <option value="piano" selected>Piano (best quality)</option>
+                    <option value="general">General audio</option>
+                </select>
+                <input type="text" id="audioUrlInput" placeholder="YouTube URL (content you may download)" />
+                <button id="transcribeUrlBtn" type="button">Make MIDI</button>
+                <button id="chooseAudioBtn" type="button">Upload audio</button>
+                <input
+                    id="audioFileInput"
+                    type="file"
+                    hidden
+                    accept=".mp3,.wav,.m4a,.ogg,.flac,.aac,.webm,.mp4,audio/*"
+                />
+            </div>
+            <div class="lightweight-setting">
+                <label>
+                    <input id="lightweightMode" type="checkbox" />
+                    Lightweight Mode
+                    <span>(optional: cleaner, max 3 notes)</span>
+                </label>
+            </div>
+            <p class="audio-import-note">Use Piano for solo piano recordings. Use General for other instruments or mixed audio.</p>
         </div>
 
         <div id="status">Ready. Search any song to make a Game Boy version.</div>
@@ -1279,28 +1358,32 @@
     <div id="faqModalBackdrop" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="faqTitle">
         <div class="modal" role="document">
             <header>
-                <h3 id="faqTitle">FAQ</h3>
+                <h3 id="faqTitle">WHY I MADE THIS</h3>
                 <div class="spacer"></div>
                 <button id="faqCloseBtn" type="button">Close</button>
             </header>
             <main>
                 <div class="faq-grid">
                     <div class="faq-item">
-                        <h4>How it works</h4>
-                        <p>Search a song, pick a MIDI source, hit Generate. The Wario Synthesis Engine analyses the MIDI and resynthesises it using Web Audio oscillators tuned to mimic the Game Boy's 4-channel sound chip. All processing runs in your browser.</p>
+                        <h4>Why this fork exists</h4>
+                        <p>I love the idea of turning familiar songs and sounds into Game Boy-style versions. It adds a new creative element for videos, streams, games, and other content.</p>
                     </div>
                     <div class="faq-item">
-                        <h4>Why "Enable Audio" on iPhone?</h4>
-                        <p>Apple blocks sound until you tap something. Hit the button once and you're good. Still silent? Check your ringer switch.</p>
+                        <h4>The limitation I wanted to fix</h4>
+                        <p>The original version mainly searched for MIDI files already available through its sources. That leaves out a lot of music. This fork adds audio uploads, YouTube-title importing, dedicated piano transcription, and smarter arrangement so creators have more options.</p>
                     </div>
                     <div class="faq-item">
-                        <h4>About</h4>
-                        <p>A non-commercial project by <a href="https://x.com/b1rdmania" target="_blank" rel="noopener noreferrer">@b1rdmania</a> for lols. Please don't sue me. Built with Claude Code.</p>
-                        <p style="margin-top: 8px;"><a href="https://github.com/b1rdmania/motif" target="_blank" rel="noopener noreferrer">GitHub repo</a></p>
+                        <h4>Creators and copyright</h4>
+                        <p>I wanted to explore whether a heavily reinterpreted chiptune version could be more useful for content creators than simply replaying the original recording. However, transformation does not automatically clear copyright, prevent claims, or grant permission. Credit the original artist and only use music you have the right to use.</p>
                     </div>
                     <div class="faq-item">
-                        <h4>Ps. I love Claude Code.</h4>
-                        <img src="/wario.png" alt="Wario moment" style="margin-top: 8px; max-width: 100%; opacity: 0.85;" />
+                        <h4>Credit to the original</h4>
+                        <p>This is the Tony Destin fork of Wario Synth, built from the original project by <a href="https://github.com/b1rdmania" target="_blank" rel="noopener noreferrer">b1rdmania</a>. The original concept, interface, and synthesis foundation deserve full credit.</p>
+                        <p style="margin-top: 8px;"><a href="https://github.com/b1rdmania/motif" target="_blank" rel="noopener noreferrer">View the original Wario Synth repository</a></p>
+                    </div>
+                    <div class="faq-item">
+                        <h4>Lightweight Mode</h4>
+                        <p>Lightweight Mode keeps arrangements readable during busy piano passages: clean note handoffs, three notes maximum, a locked top melody, one light harmony voice, and output compression.</p>
                     </div>
                 </div>
             </main>

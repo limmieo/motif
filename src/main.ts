@@ -15,6 +15,11 @@ class MotifApp {
   
   private searchBtn!: HTMLButtonElement;
   private songInput!: HTMLInputElement;
+  private audioUrlInput!: HTMLInputElement;
+  private transcriptionMode!: HTMLSelectElement;
+  private transcribeUrlBtn!: HTMLButtonElement;
+  private audioFileInput!: HTMLInputElement;
+  private chooseAudioBtn!: HTMLButtonElement;
   private status!: HTMLElement;
   
   private resultsSection!: HTMLElement;
@@ -41,6 +46,7 @@ class MotifApp {
 
   // Motif controls
   private motifBtn!: HTMLButtonElement;
+  private lightweightMode!: HTMLInputElement;
   private motifProgressContainer!: HTMLElement;
   private motifProgressBar!: HTMLInputElement;
   private motifProgressFill!: HTMLElement;
@@ -73,6 +79,7 @@ class MotifApp {
   private searchResults: any[] = [];
   private selectedResultIndex = 0;
   private currentMIDI: { events: NoteEvent[], metadata: any } | null = null;
+  private currentMIDIIsShareable = false;
 
   constructor() {
     this.motifEngine = new MotifEngine();
@@ -102,6 +109,11 @@ class MotifApp {
   private initializeUI(): void {
     this.searchBtn = document.getElementById('searchBtn') as HTMLButtonElement;
     this.songInput = document.getElementById('songInput') as HTMLInputElement;
+    this.audioUrlInput = document.getElementById('audioUrlInput') as HTMLInputElement;
+    this.transcriptionMode = document.getElementById('transcriptionMode') as HTMLSelectElement;
+    this.transcribeUrlBtn = document.getElementById('transcribeUrlBtn') as HTMLButtonElement;
+    this.audioFileInput = document.getElementById('audioFileInput') as HTMLInputElement;
+    this.chooseAudioBtn = document.getElementById('chooseAudioBtn') as HTMLButtonElement;
     this.status = document.getElementById('status')!;
 
     this.resultsSection = document.getElementById('resultsSection')!;
@@ -121,6 +133,7 @@ class MotifApp {
 
     // Motif controls
     this.motifBtn = document.getElementById('motifBtn') as HTMLButtonElement;
+    this.lightweightMode = document.getElementById('lightweightMode') as HTMLInputElement;
     this.motifProgressContainer = document.getElementById('motifProgressContainer')!;
     this.motifProgressBar = document.getElementById('motifProgressBar') as HTMLInputElement;
     this.motifProgressFill = document.getElementById('motifProgressFill')!;
@@ -163,6 +176,12 @@ class MotifApp {
 
     // Use both click and touchend for iOS compatibility
     this.searchBtn.addEventListener('click', doSearch);
+    this.transcribeUrlBtn.addEventListener('click', () => void this.handleYouTubeTranscription());
+    this.chooseAudioBtn.addEventListener('click', () => this.audioFileInput.click());
+    this.audioFileInput.addEventListener('change', () => {
+      const file = this.audioFileInput.files?.[0];
+      if (file) void this.handleAudioUpload(file);
+    });
 
     this.songInput.addEventListener('keypress', (e) => {
       if (e.key === 'Enter') {
@@ -210,6 +229,71 @@ class MotifApp {
     });
   }
 
+  private async handleYouTubeTranscription(): Promise<void> {
+    const url = this.audioUrlInput.value.trim();
+    if (!url) {
+      this.updateStatus('Paste a YouTube URL first.');
+      return;
+    }
+    await this.runTranscription(
+      () => this.midiService.transcribeYouTube(url, this.getTranscriptionMode()),
+      'YouTube transcription'
+    );
+  }
+
+  private async handleAudioUpload(file: File): Promise<void> {
+    await this.runTranscription(
+      () => this.midiService.transcribeAudioFile(file, this.getTranscriptionMode()),
+      file.name.replace(/\.[^.]+$/, '') || 'Audio transcription'
+    );
+    this.audioFileInput.value = '';
+  }
+
+  private getTranscriptionMode(): 'piano' | 'general' {
+    return this.transcriptionMode.value === 'general' ? 'general' : 'piano';
+  }
+
+  private async runTranscription(
+    load: () => Promise<{ midi: ArrayBuffer; title?: string; arrangement?: string }>,
+    fallbackTitle: string
+  ): Promise<void> {
+    this.transcribeUrlBtn.disabled = true;
+    this.chooseAudioBtn.disabled = true;
+    const modeLabel = this.getTranscriptionMode() === 'piano' ? 'piano model' : 'general model';
+    this.updateStatus(`Transcribing with the ${modeLabel}. This can take several minutes...`);
+    this.handleMotifStop();
+    this.stopPreview();
+
+    try {
+      const transcription = await load();
+      const midiBuffer = transcription.midi;
+      const title = transcription.title || fallbackTitle;
+      const events = MIDIParser.parseMIDI(midiBuffer);
+      if (events.length === 0) throw new Error('The transcription contained no playable notes.');
+      const metadata = MIDIParser.getMIDIInfo(midiBuffer);
+      const duration = Math.max(...events.map(event => event.time + event.duration));
+      this.currentMIDI = { events, metadata: { ...metadata, duration } };
+      this.currentMIDIIsShareable = false;
+      this.hasGenerated = false;
+      this.selectedTitle.textContent = this.cleanSongTitle(title);
+      this.selectedMeta.textContent = transcription.arrangement === 'composer'
+        ? 'Source: automatic audio transcription, arranged for Game Boy voices (melody / bass / arpeggio)'
+        : 'Source: automatic audio transcription (results may need cleanup)';
+      this.enablePlayerControls();
+      this.copyLinkBtn.disabled = true;
+      this.updateIOSAudioBanner();
+      this.setState('selected');
+      this.resultsSection.classList.remove('visible');
+      this.updateStatus('MIDI created. Preview it, then generate the Game Boy version.');
+      this.playerSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (error) {
+      this.updateStatus(`Transcription error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      this.transcribeUrlBtn.disabled = false;
+      this.chooseAudioBtn.disabled = false;
+    }
+  }
+
   private openFaq(): void {
     this.faqBackdrop.classList.add('open');
     // focus close for keyboard users
@@ -228,6 +312,7 @@ class MotifApp {
     this.isMotifPlaying = false;
     this.motifResumeProgress = 0;
     this.currentMIDI = null;
+    this.currentMIDIIsShareable = false;
 
     this.setState('idle');
     this.updateStatus('Ready. Search any song to make a Game Boy version.');
@@ -435,6 +520,7 @@ class MotifApp {
       }
 
       this.currentMIDI = { events, metadata: { ...metadata, duration: actualDuration } };
+      this.currentMIDIIsShareable = true;
 
       // Update UI
       const displayTitle = this.cleanSongTitle(result.title);
@@ -519,7 +605,9 @@ class MotifApp {
       this.playPauseBtn.disabled = true;
 
       // Generate a variation using the procedural role-mapping mode
-      await this.motifEngine.generateFromMIDI(this.currentMIDI.events, 'procedural');
+      await this.motifEngine.generateFromMIDI(this.currentMIDI.events, 'procedural', {
+        lightweightMode: this.lightweightMode.checked,
+      });
       this.motifEngine.setVolume(0.8);
 
       await this.motifEngine.play();
@@ -670,7 +758,7 @@ class MotifApp {
   }
 
   private async handleCopyLink(): Promise<void> {
-    if (!this.hasGenerated) return;
+    if (!this.hasGenerated || !this.currentMIDIIsShareable) return;
     const result = this.searchResults[this.selectedResultIndex];
     if (!result?.midiUrl) return;
 
@@ -767,7 +855,7 @@ class MotifApp {
   }
 
   private async handleShareToX(): Promise<void> {
-    if (!this.hasGenerated) return;
+    if (!this.hasGenerated || !this.currentMIDIIsShareable) return;
     const result = this.searchResults[this.selectedResultIndex];
     if (!result?.midiUrl) return;
 
@@ -828,10 +916,11 @@ class MotifApp {
     this.playerSection.classList.toggle('visible', hasSelection);
 
     // share buttons only after generation
-    this.copyLinkBtn.style.display = state === 'generated' ? 'inline-block' : 'none';
-    this.copyLinkBtn.disabled = !(state === 'generated' && this.hasGenerated);
-    this.shareToXBtn.style.display = state === 'generated' ? 'inline-block' : 'none';
-    this.shareToXBtn.disabled = !(state === 'generated' && this.hasGenerated);
+    const canShare = state === 'generated' && this.hasGenerated && this.currentMIDIIsShareable;
+    this.copyLinkBtn.style.display = canShare ? 'inline-block' : 'none';
+    this.copyLinkBtn.disabled = !canShare;
+    this.shareToXBtn.style.display = canShare ? 'inline-block' : 'none';
+    this.shareToXBtn.disabled = !canShare;
     // Hide share fallback when state changes
     this.shareFallback.style.display = 'none';
 

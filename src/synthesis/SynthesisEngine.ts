@@ -1,9 +1,14 @@
-import type { RoleAssignment, MotifConfig, SynthLayer, Role, NoteEvent, ChordEvent } from '../types';
+import type { RoleAssignment, MotifConfig, SynthLayer, Role, NoteEvent } from '../types';
+
+interface SynthesisOptions {
+  compressionEnabled?: boolean;
+}
 
 export class SynthesisEngine {
   private audioContext: AudioContext;
   private config: MotifConfig;
   private masterGain: GainNode;
+  private compressor: DynamicsCompressorNode;
   private layers: Map<Role, SynthLayer> = new Map();
   private roleAssignments: Map<Role, RoleAssignment> = new Map();
   private isPlaying = false;
@@ -11,11 +16,19 @@ export class SynthesisEngine {
   private startTime = 0;
   private nextEventIndex = new Map<Role, number>();
 
-  constructor(audioContext: AudioContext, config: MotifConfig) {
+  constructor(audioContext: AudioContext, config: MotifConfig, options: SynthesisOptions = {}) {
     this.audioContext = audioContext;
     this.config = config;
     this.masterGain = audioContext.createGain();
-    this.masterGain.connect(audioContext.destination);
+    this.compressor = audioContext.createDynamicsCompressor();
+    const compressionEnabled = options.compressionEnabled === true;
+    this.compressor.threshold.value = compressionEnabled ? -18 : 0;
+    this.compressor.knee.value = compressionEnabled ? 12 : 0;
+    this.compressor.ratio.value = compressionEnabled ? 4 : 1;
+    this.compressor.attack.value = 0.003;
+    this.compressor.release.value = 0.18;
+    this.masterGain.connect(this.compressor);
+    this.compressor.connect(audioContext.destination);
     this.masterGain.gain.value = 0.3;
   }
 
@@ -204,7 +217,7 @@ export class SynthesisEngine {
       case 'bass': return 0.4;
       case 'drone': return 0.2;
       case 'ostinato': return 0.3;
-      case 'texture': return 0.1;
+      case 'texture': return 0.065;
       case 'accents': return 0.5;
       case 'melody': return 0.35;
       default: return 0.3;
@@ -286,8 +299,9 @@ export class SynthesisEngine {
     
     // Envelope based on velocity and duration with minimum times to prevent clicks
     const gainValue = velocity * 0.5; // Scale velocity
-    const attackTime = Math.max(0.005, Math.min(0.05, duration * 0.1)); // Min 5ms attack
-    const releaseTime = Math.max(0.01, Math.min(0.1, duration * 0.3)); // Min 10ms release
+    const attackTime = Math.max(0.003, Math.min(0.025, duration * 0.06));
+    const maxRelease = role === 'texture' ? 0.07 : 0.11;
+    const releaseTime = Math.max(0.03, Math.min(maxRelease, duration * 0.2));
 
     envelope.gain.setValueAtTime(0, when);
     envelope.gain.linearRampToValueAtTime(gainValue, when + attackTime);
@@ -322,53 +336,11 @@ export class SynthesisEngine {
 
   private scheduleRoleEvents(role: Role, assignment: RoleAssignment, scheduleUntil: number): void {
     const events = assignment.events;
-    const chords = assignment.chords;
-    
-    if (!events.length && !chords.length) return;
-    
-    // For roles that support polyphony (drone, texture), prefer chords
-    if ((role === 'drone' || role === 'texture') && chords.length > 0) {
-      this.scheduleChordEvents(role, chords, scheduleUntil);
-    } else {
-      this.scheduleSingleEvents(role, events, scheduleUntil);
-    }
-  }
 
-  private scheduleChordEvents(role: Role, chords: ChordEvent[], scheduleUntil: number): void {
-    let chordIndex = this.nextEventIndex.get(role) || 0;
-    
-    while (chordIndex < chords.length) {
-      const chord = chords[chordIndex];
-      const eventTime = this.startTime + chord.time;
-      
-      // Stop if we're past the lookahead window
-      if (eventTime > scheduleUntil) break;
-      
-      // Schedule if the chord hasn't been played yet
-      if (eventTime >= this.audioContext.currentTime) {
-        this.scheduleChord(
-          role,
-          chord.pitches,
-          Math.max(0.05, chord.duration),
-          chord.velocity,
-          eventTime
-        );
-      }
-      
-      chordIndex++;
-    }
-    
-    // Update the next event index
-    this.nextEventIndex.set(role, chordIndex);
-    
-    // Loop if we've reached the end
-    if (chordIndex >= chords.length) {
-      this.nextEventIndex.set(role, 0);
-      // Reset start time for looping
-      if (Array.from(this.nextEventIndex.values()).every(idx => idx === 0)) {
-        this.startTime = this.audioContext.currentTime;
-      }
-    }
+    // The event list already contains every note in each chord. Scheduling the
+    // derived chord list instead used to drop all standalone notes between
+    // chord attacks, which made solo-piano transcriptions sound fragmented.
+    if (events.length > 0) this.scheduleSingleEvents(role, events, scheduleUntil);
   }
 
   private scheduleSingleEvents(role: Role, events: NoteEvent[], scheduleUntil: number): void {
@@ -425,69 +397,6 @@ export class SynthesisEngine {
 
     // Don't cleanup layers - keep them connected for resume
     // Layers are only cleaned up when setupLayers is called with new data
-  }
-
-  private scheduleChord(role: Role, pitches: number[], duration: number, velocity: number, when: number): void {
-    const layer = this.layers.get(role);
-    if (!layer) return;
-    
-    // Create oscillator for each pitch in the chord
-    for (const pitch of pitches) {
-      const osc = this.audioContext.createOscillator();
-      const envelope = this.audioContext.createGain();
-      
-      // Convert MIDI pitch to frequency
-      const frequency = this.midiToFrequency(pitch);
-      osc.frequency.value = frequency;
-      
-      // Choose oscillator type based on role
-      switch (role) {
-        case 'bass':
-          osc.type = 'square';
-          break;
-        case 'drone':
-          osc.type = 'sawtooth';
-          break;
-        case 'ostinato':
-          osc.type = 'triangle';
-          break;
-        case 'texture':
-          osc.type = 'sine';
-          break;
-        case 'melody':
-          osc.type = 'triangle';
-          break;
-        case 'accents':
-          osc.type = 'sine';
-          break;
-      }
-      
-      osc.connect(envelope);
-      envelope.connect(layer.filterNode);
-      
-      // Envelope based on velocity and duration, scaled for chords with minimum times to prevent clicks
-      const gainValue = (velocity * 0.3) / Math.max(pitches.length * 0.5, 1); // Scale down for chords
-      const attackTime = Math.max(0.005, Math.min(0.05, duration * 0.1)); // Min 5ms attack
-      const releaseTime = Math.max(0.01, Math.min(0.1, duration * 0.3)); // Min 10ms release
-
-      envelope.gain.setValueAtTime(0, when);
-      envelope.gain.linearRampToValueAtTime(gainValue, when + attackTime);
-      envelope.gain.setValueAtTime(gainValue, when + Math.max(attackTime, duration - releaseTime));
-      envelope.gain.exponentialRampToValueAtTime(0.001, when + duration + releaseTime);
-
-      osc.start(when);
-      osc.stop(when + duration + releaseTime + 0.01); // Stop after envelope completes
-
-      // Clean up after note ends
-      setTimeout(() => {
-        try {
-          osc.disconnect();
-          envelope.disconnect();
-        } catch (e) {
-          // Already disconnected
-        }
-      }, (duration + releaseTime + 0.1) * 1000);
-    }
   }
 
   private cleanupLayers(): void {
@@ -688,8 +597,8 @@ export class SynthesisEngine {
     envelope.connect(filterNode);
 
     const gainValue = velocity * 0.5;
-    const attackTime = Math.max(0.005, Math.min(0.05, duration * 0.1));
-    const releaseTime = Math.max(0.01, Math.min(0.1, duration * 0.3));
+    const attackTime = Math.max(0.003, Math.min(0.025, duration * 0.06));
+    const releaseTime = Math.max(0.04, Math.min(0.16, duration * 0.25));
 
     envelope.gain.setValueAtTime(0, when);
     envelope.gain.linearRampToValueAtTime(gainValue, when + attackTime);
@@ -720,8 +629,8 @@ export class SynthesisEngine {
       envelope.connect(filterNode);
 
       const gainValue = (velocity * 0.3) / Math.max(pitches.length * 0.5, 1);
-      const attackTime = Math.max(0.005, Math.min(0.05, duration * 0.1));
-      const releaseTime = Math.max(0.01, Math.min(0.1, duration * 0.3));
+      const attackTime = Math.max(0.003, Math.min(0.025, duration * 0.06));
+      const releaseTime = Math.max(0.04, Math.min(0.16, duration * 0.25));
 
       envelope.gain.setValueAtTime(0, when);
       envelope.gain.linearRampToValueAtTime(gainValue, when + attackTime);

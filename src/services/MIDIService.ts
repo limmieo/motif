@@ -31,6 +31,12 @@ interface MIDISearchResponse {
   count: number;
 }
 
+export interface AudioTranscriptionResult {
+  midi: ArrayBuffer;
+  title?: string;
+  arrangement?: string;
+}
+
 export class MIDIService {
   private baseUrl: string;
 
@@ -120,6 +126,56 @@ export class MIDIService {
       console.error('MIDI parse error:', error);
       return null;
     }
+  }
+
+  async transcribeYouTube(url: string, mode: 'piano' | 'general'): Promise<AudioTranscriptionResult> {
+    const response = await this.fetchWithRetry(
+      `${this.baseUrl}/api/audio/transcribe-url`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, mode }),
+      },
+      16 * 60 * 1000
+    );
+    return this.readTranscription(response);
+  }
+
+  async transcribeAudioFile(file: File, mode: 'piano' | 'general'): Promise<AudioTranscriptionResult> {
+    const response = await this.fetchWithRetry(
+      `${this.baseUrl}/api/audio/transcribe-upload?filename=${encodeURIComponent(file.name)}&mode=${mode}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: file,
+      },
+      16 * 60 * 1000
+    );
+    return this.readTranscription(response);
+  }
+
+  private async readTranscription(response: Response): Promise<AudioTranscriptionResult> {
+    if (!response.ok) {
+      let message = `Transcription failed: ${response.status}`;
+      try {
+        const body = await response.json() as { error?: string };
+        if (body.error) message = body.error;
+      } catch {
+        // Keep the HTTP status fallback.
+      }
+      throw new Error(message);
+    }
+    const encodedTitle = response.headers.get('X-Motif-Title');
+    let title: string | undefined;
+    if (encodedTitle) {
+      try {
+        title = decodeURIComponent(encodedTitle);
+      } catch {
+        title = encodedTitle;
+      }
+    }
+    const arrangement = response.headers.get('X-Motif-Arrangement') || undefined;
+    return { midi: await response.arrayBuffer(), title, arrangement };
   }
 
   async checkHealth(): Promise<boolean> {

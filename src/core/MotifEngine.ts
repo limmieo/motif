@@ -1,10 +1,14 @@
-import type { NoteEvent, MotifConfig } from '../types';
+import type { NoteEvent, MotifConfig, Role, RoleAssignment, TrackFeatures } from '../types';
 import { MIDIProcessor } from '../midi/MIDIProcessor';
 import { MIDIParser } from '../midi/MIDIParser';
 import { MIDIService } from '../services/MIDIService';
 import { RoleMapper } from './RoleMapper';
 import { SynthesisEngine } from '../synthesis/SynthesisEngine';
 import { unlockAudio } from '../utils/audioUnlock';
+
+export interface GenerationOptions {
+  lightweightMode?: boolean;
+}
 
 export class MotifEngine {
   private audioContext: AudioContext | null = null;
@@ -29,14 +33,18 @@ export class MotifEngine {
 
   async generateFromMIDI(
     events: NoteEvent[],
-    transformMode: 'passthrough' | 'procedural' = 'passthrough'
+    transformMode: 'passthrough' | 'procedural' = 'passthrough',
+    options: GenerationOptions = {}
   ): Promise<void> {
     // Initialize audio context using shared unlock (iOS compatibility)
     if (!this.audioContext) {
       this.audioContext = await unlockAudio();
     }
 
-    this.synthesisEngine = new SynthesisEngine(this.audioContext, this.config);
+    const lightweightMode = options.lightweightMode === true;
+    this.synthesisEngine = new SynthesisEngine(this.audioContext, this.config, {
+      compressionEnabled: lightweightMode,
+    });
 
     if (transformMode === 'passthrough') {
       // Direct playback mode - play MIDI as-is without transformations
@@ -64,11 +72,115 @@ export class MotifEngine {
       console.log('Motif: Passthrough mode - playing original MIDI patterns');
     } else {
       // Procedural mode - transform the MIDI with role mapping
-      const features = this.midiProcessor.extractFeatures(events);
-      const roleAssignments = this.roleMapper.assignRoles(features, events);
+      const roleAssignments = this.looksLikeSoloPiano(events)
+        ? this.arrangeSoloPiano(events, lightweightMode)
+        : this.roleMapper.assignRoles(this.midiProcessor.extractFeatures(events), events);
       this.synthesisEngine.setupLayers(roleAssignments);
       console.log('Motif: Procedural mode - transforming MIDI with role mapping');
     }
+  }
+
+  private looksLikeSoloPiano(events: NoteEvent[]): boolean {
+    const tracks = new Set(events.map(event => event.track));
+    if (tracks.size !== 1 || events.length < 8) return false;
+
+    const groups = this.groupByOnset(events);
+    const polyphonicGroups = groups.filter(group => group.length > 1).length;
+    return polyphonicGroups / Math.max(groups.length, 1) >= 0.12;
+  }
+
+  private arrangeSoloPiano(events: NoteEvent[], lightweightMode: boolean): RoleAssignment[] {
+    const voices = new Map<Role, NoteEvent[]>([
+      ['bass', []],
+      ['texture', []],
+      ['melody', []],
+    ]);
+
+    for (const group of this.groupByOnset(events)) {
+      const ordered = [...group].sort((a, b) => a.pitch - b.pitch);
+      if (ordered.length === 1) {
+        const note = ordered[0];
+        const role: Role = note.pitch < 48 ? 'bass' : 'melody';
+        voices.get(role)!.push(note);
+        continue;
+      }
+
+      voices.get('bass')!.push(ordered[0]);
+      voices.get('melody')!.push(ordered[ordered.length - 1]);
+      if (ordered.length > 2) {
+        const innerVoices = ordered.slice(1, -1);
+        const center = innerVoices.reduce((sum, note) => sum + note.pitch, 0) / innerVoices.length;
+        voices.get('texture')!.push(
+          ...innerVoices
+            .sort((a, b) => Math.abs(a.pitch - center) - Math.abs(b.pitch - center))
+            .slice(0, lightweightMode ? 1 : 2)
+        );
+      }
+    }
+
+    const assignments: RoleAssignment[] = [];
+    for (const [role, voiceEvents] of voices) {
+      if (voiceEvents.length === 0) continue;
+      voiceEvents.sort((a, b) => a.time - b.time || a.pitch - b.pitch);
+      this.trimVoiceOverlap(voiceEvents, role, lightweightMode);
+      assignments.push({
+        role,
+        sourceTrack: voiceEvents[0].track,
+        events: voiceEvents,
+        chords: [],
+        confidence: 1,
+        features: this.describeVoice(voiceEvents),
+      });
+    }
+    return assignments;
+  }
+
+  private trimVoiceOverlap(events: NoteEvent[], role: Role, lightweightMode: boolean): void {
+    const groups = this.groupByOnset(events);
+    const overlap = lightweightMode ? 0 : role === 'texture' ? 0.03 : 0.015;
+
+    for (let index = 0; index < groups.length - 1; index++) {
+      const nextOnset = groups[index + 1][0].time;
+      for (const event of groups[index]) {
+        const latestEnd = nextOnset + overlap;
+        if (event.time < nextOnset && event.time + event.duration > latestEnd) {
+          event.duration = Math.max(0.06, latestEnd - event.time);
+        }
+      }
+    }
+  }
+
+  private groupByOnset(events: NoteEvent[]): NoteEvent[][] {
+    const windowSeconds = 0.055;
+    const sorted = [...events].sort((a, b) => a.time - b.time || a.pitch - b.pitch);
+    const groups: NoteEvent[][] = [];
+
+    for (const event of sorted) {
+      const current = groups[groups.length - 1];
+      if (current && Math.abs(event.time - current[0].time) <= windowSeconds) {
+        current.push(event);
+      } else {
+        groups.push([event]);
+      }
+    }
+    return groups;
+  }
+
+  private describeVoice(events: NoteEvent[]): TrackFeatures {
+    const pitches = events.map(event => event.pitch).sort((a, b) => a - b);
+    const medianPitch = pitches[Math.floor(pitches.length / 2)];
+    const totalDuration = Math.max(...events.map(event => event.time + event.duration));
+    return {
+      medianPitch,
+      pitchRange: pitches[pitches.length - 1] - pitches[0],
+      noteDensity: events.length / Math.max(totalDuration, 1),
+      polyphonyRatio: 0,
+      averageDuration: events.reduce((sum, event) => sum + event.duration, 0) / events.length,
+      repetitionScore: 0,
+      isMonophonic: true,
+      hasPhraseContinuity: true,
+      register: medianPitch < 48 ? 'low' : medianPitch < 72 ? 'mid' : 'high',
+    };
   }
 
   async generateFromSong(songName: string): Promise<void> {

@@ -1,6 +1,12 @@
 import express from 'express';
 import cors from 'cors';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { kv } from '@vercel/kv';
 import { createClient } from 'redis';
 import { MIDISearchService } from './services/MIDISearchService.js';
@@ -10,8 +16,83 @@ import { MIDIParseService } from './services/MIDIParseService.js';
 const app = express();
 const port = process.env.PORT || 3001;
 
-app.use(cors());
+app.use(cors({ exposedHeaders: ['X-Motif-Title', 'X-Motif-Arrangement'] }));
 app.use(express.json());
+
+const serverDir = path.dirname(fileURLToPath(import.meta.url));
+const audioScript = path.resolve(serverDir, '../python/audio_to_midi.py');
+const localPython = process.platform === 'win32'
+  ? path.resolve(serverDir, '../.venv/Scripts/python.exe')
+  : path.resolve(serverDir, '../.venv/bin/python');
+const pythonCommand = process.env.PYTHON_PATH
+  || (existsSync(localPython) ? localPython : (process.platform === 'win32' ? 'python' : 'python3'));
+
+type AudioTranscriptionResult = {
+  midi: Buffer;
+  title?: string;
+  arrangement?: string;
+};
+
+async function runAudioTranscription(args: string[]): Promise<AudioTranscriptionResult> {
+  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'motif-transcribe-'));
+  const midiPath = path.join(workDir, 'transcription.mid');
+  const metadataPath = path.join(workDir, 'metadata.json');
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(
+        pythonCommand,
+        [audioScript, ...args, '--output', midiPath, '--metadata-output', metadataPath],
+        { env: process.env, windowsHide: true }
+      );
+      let stderr = '';
+      const timeout = setTimeout(() => {
+        child.kill();
+        reject(new Error('Transcription timed out after 15 minutes.'));
+      }, 15 * 60 * 1000);
+
+      child.stderr.on('data', chunk => {
+        stderr += String(chunk);
+      });
+      child.on('error', error => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.on('close', code => {
+        clearTimeout(timeout);
+        if (code === 0) resolve();
+        else reject(new Error(stderr.trim() || `Transcription exited with code ${code}.`));
+      });
+    });
+    const midi = await fs.readFile(midiPath);
+    let title: string | undefined;
+    let arrangement: string | undefined;
+    try {
+      const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')) as {
+        title?: unknown;
+        arrangement?: unknown;
+      };
+      if (typeof metadata.title === 'string') title = metadata.title.slice(0, 300);
+      if (typeof metadata.arrangement === 'string') arrangement = metadata.arrangement.slice(0, 50);
+    } catch {
+      // Metadata is helpful but not required for playback.
+    }
+    return { midi, title, arrangement };
+  } finally {
+    await fs.rm(workDir, { recursive: true, force: true });
+  }
+}
+
+function sendTranscriptionError(res: express.Response, error: unknown): void {
+  console.error('Audio transcription error:', error);
+  const detail = error instanceof Error ? error.message : 'Audio transcription failed.';
+  const missingDependency = /No module named|not recognized|ENOENT|FFmpeg was not found/i.test(detail);
+  res.status(missingDependency ? 503 : 500).json({
+    error: missingDependency
+      ? 'Audio transcription is not installed. Run pip install -r server/requirements-audio.txt and configure FFmpeg.'
+      : detail,
+  });
+}
 
 const searchService = new MIDISearchService();
 const fetchService = new MIDIFetchService();
@@ -153,6 +234,69 @@ app.get('/api/midi/search', async (req, res) => {
     res.status(500).json({ error: 'Search failed' });
   }
 });
+
+// Use only for media the user owns or has permission to download.
+app.post('/api/audio/transcribe-url', async (req, res) => {
+  try {
+    const url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
+    const mode = req.body?.mode === 'general' ? 'general' : 'piano';
+    if (!url) return res.status(400).json({ error: 'A YouTube URL is required.' });
+
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return res.status(400).json({ error: 'Enter a valid YouTube URL.' });
+    }
+    const allowedHosts = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be']);
+    if (!allowedHosts.has(parsed.hostname.toLowerCase())) {
+      return res.status(400).json({ error: 'Only YouTube URLs are supported.' });
+    }
+
+    const result = await runAudioTranscription(['--url', url, '--mode', mode]);
+    res.setHeader('Content-Type', 'audio/midi');
+    res.setHeader('Content-Disposition', 'attachment; filename="transcription.mid"');
+    if (result.title) res.setHeader('X-Motif-Title', encodeURIComponent(result.title));
+    if (result.arrangement) res.setHeader('X-Motif-Arrangement', result.arrangement);
+    res.send(result.midi);
+  } catch (error) {
+    sendTranscriptionError(res, error);
+  }
+});
+
+app.post(
+  '/api/audio/transcribe-upload',
+  express.raw({ type: 'application/octet-stream', limit: '150mb' }),
+  async (req, res) => {
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'motif-upload-'));
+    try {
+      const requestedName = String(req.query.filename || 'upload.wav');
+      const mode = req.query.mode === 'general' ? 'general' : 'piano';
+      const extension = path.extname(requestedName).toLowerCase();
+      const allowedExtensions = new Set(['.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac', '.webm', '.mp4']);
+      if (!allowedExtensions.has(extension)) {
+        return res.status(400).json({ error: 'Unsupported audio format.' });
+      }
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        return res.status(400).json({ error: 'The uploaded audio file is empty.' });
+      }
+
+      const inputPath = path.join(workDir, `upload${extension}`);
+      await fs.writeFile(inputPath, req.body);
+      const result = await runAudioTranscription(['--input', inputPath, '--mode', mode]);
+      res.setHeader('Content-Type', 'audio/midi');
+      res.setHeader('Content-Disposition', 'attachment; filename="transcription.mid"');
+      const uploadTitle = path.parse(requestedName).name.slice(0, 300);
+      res.setHeader('X-Motif-Title', encodeURIComponent(uploadTitle));
+      if (result.arrangement) res.setHeader('X-Motif-Arrangement', result.arrangement);
+      res.send(result.midi);
+    } catch (error) {
+      sendTranscriptionError(res, error);
+    } finally {
+      await fs.rm(workDir, { recursive: true, force: true });
+    }
+  }
+);
 
 // Create a short share link
 app.post('/api/share', async (req, res) => {

@@ -1,0 +1,6 @@
+# Optional local audio-to-MIDI feature.
+# Basic Pitch currently supports Python 3.7-3.11.
+basic-pitch
+yt-dlp[default]>=2026.6.9
+torch
+piano-transcription-inference

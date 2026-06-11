@@ -38,6 +38,15 @@ if errorlevel 1 (
     if errorlevel 1 goto :error
 )
 
+where nvidia-smi >nul 2>&1
+if not errorlevel 1 (
+    "server\.venv\Scripts\python.exe" -c "import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)" >nul 2>&1
+    if errorlevel 1 (
+        echo NVIDIA GPU found. Installing GPU acceleration. One-time large download...
+        "server\.venv\Scripts\python.exe" -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128 --upgrade
+    )
+)
+
 if not exist "server\models\piano-note-pedal.pth" (
     echo Downloading Piano Mode model. This is a one-time 165 MB download...
     if not exist "server\models" mkdir "server\models"

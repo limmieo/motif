@@ -109,6 +109,13 @@ server/.venv/Scripts/python -m pip install -r server/requirements-audio.txt
 Set `FFMPEG_PATH` if `ffmpeg` is not on your `PATH`. YouTube downloading is
 intended only for media you own or have permission to download.
 
+If you have an NVIDIA GPU, install the CUDA build of torch for much faster
+separation and piano transcription (the launcher does this automatically):
+
+```bash
+server/.venv/Scripts/python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128 --upgrade
+```
+
 ## Tech Stack
 
 - **Audio pipeline**: Python, yt-dlp, FFmpeg, Basic Pitch,

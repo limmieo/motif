@@ -64,6 +64,14 @@ export class SynthesisEngine {
     return Array.from(this.layers.keys());
   }
 
+  /** Per-voice note events (normalized timeline) for visualization. */
+  getVoiceEvents(): Array<{ role: Role; events: NoteEvent[] }> {
+    return Array.from(this.roleAssignments.entries()).map(([role, assignment]) => ({
+      role,
+      events: assignment.events,
+    }));
+  }
+
   /** Set a per-voice volume multiplier (0..1). */
   setVoiceLevel(role: Role, level: number): void {
     this.voiceLevels.set(role, Math.max(0, Math.min(1, level)));

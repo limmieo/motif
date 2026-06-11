@@ -112,6 +112,10 @@ export class MotifEngine {
     return this.synthesisEngine ? this.synthesisEngine.getActiveVoices() : [];
   }
 
+  getVoiceEvents(): Array<{ role: Role; events: NoteEvent[] }> {
+    return this.synthesisEngine ? this.synthesisEngine.getVoiceEvents() : [];
+  }
+
   setVoiceLevel(role: Role, level: number): void {
     this.synthesisEngine?.setVoiceLevel(role, level);
   }

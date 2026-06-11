@@ -26,6 +26,9 @@ class MotifApp {
   private sectionLoopSelect!: HTMLSelectElement;
   private downloadMidiBtn!: HTMLButtonElement;
   private downloadWavBtn!: HTMLButtonElement;
+  private pianoRoll!: HTMLCanvasElement;
+  private pianoRollFrame: number | null = null;
+  private pianoRollRange: { min: number; max: number } | null = null;
   private transcribeUrlBtn!: HTMLButtonElement;
   private audioFileInput!: HTMLInputElement;
   private chooseAudioBtn!: HTMLButtonElement;
@@ -134,6 +137,7 @@ class MotifApp {
     this.sectionLoopSelect = document.getElementById('sectionLoopSelect') as HTMLSelectElement;
     this.downloadMidiBtn = document.getElementById('downloadMidiBtn') as HTMLButtonElement;
     this.downloadWavBtn = document.getElementById('downloadWavBtn') as HTMLButtonElement;
+    this.pianoRoll = document.getElementById('pianoRoll') as HTMLCanvasElement;
     this.transcribeUrlBtn = document.getElementById('transcribeUrlBtn') as HTMLButtonElement;
     this.audioFileInput = document.getElementById('audioFileInput') as HTMLInputElement;
     this.chooseAudioBtn = document.getElementById('chooseAudioBtn') as HTMLButtonElement;
@@ -777,6 +781,8 @@ class MotifApp {
       this.hasGenerated = true;
       this.renderVoiceMixer();
       this.setupSectionLoop();
+      this.initPianoRoll();
+      this.startPianoRollAnimation();
       // Refresh generated state now that generation succeeded (enables Copy link, etc.)
       const scrollYEnd = window.scrollY;
       this.setState('generated');
@@ -795,6 +801,8 @@ class MotifApp {
     this.isMotifPlaying = false;
     this.playPauseBtn.textContent = 'Play';
     this.stopMotifProgressUpdates();
+    this.stopPianoRollAnimation();
+    this.drawPianoRoll();
     this.updateStatus('');
   }
 
@@ -807,6 +815,130 @@ class MotifApp {
     accents: 'Accents',
     percussion: 'Drums (noise)',
   };
+
+  // Original DMG screen shades, brightest for the lead.
+  private static readonly ROLL_COLORS: Record<string, string> = {
+    melody: '#9bbc0e',
+    ostinato: '#8bac0f',
+    texture: '#8bac0f',
+    accents: '#9bbc0e',
+    drone: '#306230',
+    bass: '#306230',
+  };
+
+  private initPianoRoll(): void {
+    const voices = this.motifEngine.getVoiceEvents();
+    const pitches = voices
+      .filter(voice => voice.role !== 'percussion')
+      .flatMap(voice => voice.events.map(event => event.pitch));
+    if (pitches.length === 0) {
+      this.pianoRoll.style.display = 'none';
+      this.pianoRollRange = null;
+      return;
+    }
+    this.pianoRollRange = {
+      min: Math.min(...pitches) - 2,
+      max: Math.max(...pitches) + 2,
+    };
+    this.pianoRoll.style.display = 'block';
+    this.drawPianoRoll();
+  }
+
+  private startPianoRollAnimation(): void {
+    this.stopPianoRollAnimation();
+    if (!this.pianoRollRange) return;
+    const loop = () => {
+      this.drawPianoRoll();
+      this.pianoRollFrame = requestAnimationFrame(loop);
+    };
+    this.pianoRollFrame = requestAnimationFrame(loop);
+  }
+
+  private stopPianoRollAnimation(): void {
+    if (this.pianoRollFrame !== null) {
+      cancelAnimationFrame(this.pianoRollFrame);
+      this.pianoRollFrame = null;
+    }
+  }
+
+  private drawPianoRoll(): void {
+    const range = this.pianoRollRange;
+    if (!range) return;
+    const voices = this.motifEngine.getVoiceEvents();
+    if (voices.length === 0) return;
+
+    const canvas = this.pianoRoll;
+    const dpr = window.devicePixelRatio || 1;
+    const width = canvas.clientWidth;
+    const height = canvas.clientHeight;
+    if (width === 0 || height === 0) return;
+    if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
+    }
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // The playhead sits a quarter in: 2 seconds of past, 6 of future.
+    // When paused the engine reports 0, so fall back to the resume position.
+    const now = this.isMotifPlaying
+      ? this.motifEngine.getCurrentTime()
+      : this.motifResumeProgress * this.motifEngine.getDuration();
+    const windowStart = now - 2;
+    const windowSpan = 8;
+
+    ctx.fillStyle = '#0f380f';
+    ctx.fillRect(0, 0, width, height);
+
+    // One faint gridline per second.
+    ctx.strokeStyle = 'rgba(139, 172, 15, 0.16)';
+    ctx.lineWidth = 1;
+    for (let second = Math.ceil(windowStart); second <= windowStart + windowSpan; second++) {
+      if (second < 0) continue;
+      const x = ((second - windowStart) / windowSpan) * width;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, height);
+      ctx.stroke();
+    }
+
+    const drumLaneHeight = 18;
+    const pitchedHeight = height - drumLaneHeight - 4;
+    const laneCount = Math.max(1, range.max - range.min);
+    const laneHeight = pitchedHeight / laneCount;
+
+    for (const voice of voices) {
+      const isDrums = voice.role === 'percussion';
+      const baseColor = MotifApp.ROLL_COLORS[voice.role] ?? '#8bac0f';
+      for (const event of voice.events) {
+        if (event.time >= windowStart + windowSpan) break;
+        if (event.time + event.duration <= windowStart) continue;
+        const x = ((event.time - windowStart) / windowSpan) * width;
+        const noteWidth = Math.max(2, (event.duration / windowSpan) * width - 1);
+        const active = now >= event.time && now <= event.time + event.duration;
+        ctx.fillStyle = active ? '#e0f8d0' : baseColor;
+        if (isDrums) {
+          // Two thin lanes at the bottom: kicks low, hats high.
+          const lane = event.pitch <= 38 ? 1 : 0;
+          const y = height - drumLaneHeight + lane * (drumLaneHeight / 2) + 2;
+          ctx.fillRect(x, y, Math.max(2, Math.min(noteWidth, 4)), drumLaneHeight / 2 - 3);
+        } else {
+          const y = ((range.max - event.pitch) / laneCount) * pitchedHeight + 2;
+          ctx.fillRect(x, y, noteWidth, Math.max(2, laneHeight - 1));
+        }
+      }
+    }
+
+    // Playhead.
+    const playheadX = (2 / windowSpan) * width;
+    ctx.strokeStyle = 'rgba(224, 248, 208, 0.8)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(playheadX, 0);
+    ctx.lineTo(playheadX, height);
+    ctx.stroke();
+  }
 
   private renderVoiceMixer(): void {
     const voices = this.motifEngine.getActiveVoices();
@@ -995,6 +1127,7 @@ class MotifApp {
     this.motifProgressBar.value = (progress * 100).toString();
     this.motifProgressFill.style.width = `${progress * 100}%`;
     this.motifCurrentTime.textContent = this.formatTime(progress * duration);
+    this.drawPianoRoll();
   }
 
   private startMotifProgressUpdates(): void {
@@ -1296,6 +1429,7 @@ class MotifApp {
       this.motifEngine.stop();
       this.isMotifPlaying = false;
       this.stopMotifProgressUpdates();
+      this.stopPianoRollAnimation();
       this.playPauseBtn.textContent = 'Play';
       return;
     }
@@ -1311,6 +1445,7 @@ class MotifApp {
       this.isMotifPlaying = true;
       this.playPauseBtn.textContent = 'Pause';
       this.startMotifProgressUpdates();
+      this.startPianoRollAnimation();
     } catch {
       // ignore
     }

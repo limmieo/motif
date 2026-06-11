@@ -16,7 +16,14 @@ import { MIDIParseService } from './services/MIDIParseService.js';
 const app = express();
 const port = process.env.PORT || 3001;
 
-app.use(cors({ exposedHeaders: ['X-Motif-Title', 'X-Motif-Arrangement'] }));
+app.use(cors({
+  exposedHeaders: [
+    'X-Motif-Title',
+    'X-Motif-Arrangement',
+    'X-Motif-Bpm',
+    'X-Motif-Bpm-Source',
+  ],
+}));
 app.use(express.json());
 
 const serverDir = path.dirname(fileURLToPath(import.meta.url));
@@ -31,67 +38,170 @@ type AudioTranscriptionResult = {
   midi: Buffer;
   title?: string;
   arrangement?: string;
+  bpm?: number;
+  bpmSource?: string;
 };
 
-async function runAudioTranscription(args: string[]): Promise<AudioTranscriptionResult> {
-  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'motif-transcribe-'));
+type TranscriptionJob = {
+  id: string;
+  status: 'running' | 'done' | 'error';
+  percent: number;
+  label: string;
+  error?: string;
+  result?: AudioTranscriptionResult;
+  titleOverride?: string;
+  workDir: string;
+  createdAt: number;
+};
+
+const transcriptionJobs = new Map<string, TranscriptionJob>();
+const TRANSCRIPTION_JOB_TTL_MS = 10 * 60 * 1000;
+const TRANSCRIPTION_TIMEOUT_MS = 15 * 60 * 1000;
+
+function friendlyTranscriptionError(detail: string): string {
+  const missingDependency = /No module named|not recognized|ENOENT|FFmpeg was not found/i.test(detail);
+  return missingDependency
+    ? 'Audio transcription is not installed. Run pip install -r server/requirements-audio.txt and configure FFmpeg.'
+    : detail;
+}
+
+function parseBpm(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const bpm = Number(value);
+  if (!Number.isFinite(bpm) || bpm < 40 || bpm > 240) {
+    throw new Error('BPM must be a number between 40 and 240.');
+  }
+  return bpm;
+}
+
+function startTranscriptionJob(args: string[], workDir: string, titleOverride?: string): TranscriptionJob {
+  const id = crypto.randomUUID();
   const midiPath = path.join(workDir, 'transcription.mid');
   const metadataPath = path.join(workDir, 'metadata.json');
+  const job: TranscriptionJob = {
+    id,
+    status: 'running',
+    percent: 0,
+    label: 'Starting up',
+    titleOverride,
+    workDir,
+    createdAt: Date.now(),
+  };
+  transcriptionJobs.set(id, job);
 
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn(
-        pythonCommand,
-        [audioScript, ...args, '--output', midiPath, '--metadata-output', metadataPath],
-        { env: process.env, windowsHide: true }
-      );
-      let stderr = '';
-      const timeout = setTimeout(() => {
-        child.kill();
-        reject(new Error('Transcription timed out after 15 minutes.'));
-      }, 15 * 60 * 1000);
+  const child = spawn(
+    pythonCommand,
+    [audioScript, ...args, '--output', midiPath, '--metadata-output', metadataPath],
+    { env: process.env, windowsHide: true }
+  );
 
-      child.stderr.on('data', chunk => {
-        stderr += String(chunk);
-      });
-      child.on('error', error => {
-        clearTimeout(timeout);
-        reject(error);
-      });
-      child.on('close', code => {
-        clearTimeout(timeout);
-        if (code === 0) resolve();
-        else reject(new Error(stderr.trim() || `Transcription exited with code ${code}.`));
-      });
-    });
-    const midi = await fs.readFile(midiPath);
-    let title: string | undefined;
-    let arrangement: string | undefined;
-    try {
-      const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')) as {
-        title?: unknown;
-        arrangement?: unknown;
-      };
-      if (typeof metadata.title === 'string') title = metadata.title.slice(0, 300);
-      if (typeof metadata.arrangement === 'string') arrangement = metadata.arrangement.slice(0, 50);
-    } catch {
-      // Metadata is helpful but not required for playback.
+  let stderr = '';
+  let stdoutBuffer = '';
+  let timedOut = false;
+  let settled = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    child.kill();
+  }, TRANSCRIPTION_TIMEOUT_MS);
+
+  child.stdout.on('data', chunk => {
+    stdoutBuffer += String(chunk);
+    const lines = stdoutBuffer.split(/\r?\n/);
+    stdoutBuffer = lines.pop() ?? '';
+    for (const line of lines) {
+      const progressMatch = line.match(/^PROGRESS (\{.*\})$/);
+      if (progressMatch) {
+        try {
+          const update = JSON.parse(progressMatch[1]) as { percent?: unknown; label?: unknown };
+          if (typeof update.percent === 'number') {
+            job.percent = Math.max(job.percent, Math.min(99, Math.round(update.percent)));
+          }
+          if (typeof update.label === 'string') job.label = update.label.slice(0, 200);
+        } catch {
+          // Ignore malformed progress lines.
+        }
+        continue;
+      }
+      // The piano model prints "Segment 3 / 14" per chunk: real progress.
+      const segmentMatch = line.match(/Segment (\d+) \/ (\d+)/);
+      if (segmentMatch) {
+        const current = Number(segmentMatch[1]);
+        const total = Math.max(1, Number(segmentMatch[2]));
+        job.percent = Math.max(job.percent, Math.min(85, 45 + Math.round((current / total) * 40)));
+        job.label = 'Transcribing piano audio';
+      }
     }
-    return { midi, title, arrangement };
-  } finally {
-    await fs.rm(workDir, { recursive: true, force: true });
-  }
+  });
+  child.stderr.on('data', chunk => {
+    stderr += String(chunk);
+  });
+
+  const finish = async (error?: string) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeout);
+    if (error) {
+      job.status = 'error';
+      job.error = friendlyTranscriptionError(error);
+      console.error(`Transcription job ${id} failed:`, error);
+    } else {
+      try {
+        const midi = await fs.readFile(midiPath);
+        let title: string | undefined;
+        let arrangement: string | undefined;
+        let bpm: number | undefined;
+        let bpmSource: string | undefined;
+        try {
+          const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')) as {
+            title?: unknown;
+            arrangement?: unknown;
+            bpm?: unknown;
+            bpm_source?: unknown;
+          };
+          if (typeof metadata.title === 'string') title = metadata.title.slice(0, 300);
+          if (typeof metadata.arrangement === 'string') arrangement = metadata.arrangement.slice(0, 50);
+          if (typeof metadata.bpm === 'number' && Number.isFinite(metadata.bpm)) bpm = metadata.bpm;
+          if (typeof metadata.bpm_source === 'string') bpmSource = metadata.bpm_source.slice(0, 20);
+        } catch {
+          // Metadata is helpful but not required for playback.
+        }
+        job.result = {
+          midi,
+          title: job.titleOverride ?? title,
+          arrangement,
+          bpm,
+          bpmSource,
+        };
+        job.status = 'done';
+        job.percent = 100;
+        job.label = 'Done';
+      } catch (readError) {
+        job.status = 'error';
+        job.error = 'Transcription finished but produced no MIDI file.';
+        console.error(`Transcription job ${id} output missing:`, readError);
+      }
+    }
+    await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+    setTimeout(() => transcriptionJobs.delete(id), TRANSCRIPTION_JOB_TTL_MS).unref();
+  };
+
+  child.on('error', error => {
+    void finish(error.message);
+  });
+  child.on('close', code => {
+    if (code === 0) void finish();
+    else if (timedOut) void finish('Transcription timed out after 15 minutes.');
+    else void finish(stderr.trim() || `Transcription exited with code ${code}.`);
+  });
+
+  return job;
 }
 
 function sendTranscriptionError(res: express.Response, error: unknown): void {
   console.error('Audio transcription error:', error);
   const detail = error instanceof Error ? error.message : 'Audio transcription failed.';
-  const missingDependency = /No module named|not recognized|ENOENT|FFmpeg was not found/i.test(detail);
-  res.status(missingDependency ? 503 : 500).json({
-    error: missingDependency
-      ? 'Audio transcription is not installed. Run pip install -r server/requirements-audio.txt and configure FFmpeg.'
-      : detail,
-  });
+  const friendly = friendlyTranscriptionError(detail);
+  res.status(friendly === detail ? 500 : 503).json({ error: friendly });
 }
 
 const searchService = new MIDISearchService();
@@ -240,6 +350,12 @@ app.post('/api/audio/transcribe-url', async (req, res) => {
   try {
     const url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
     const mode = req.body?.mode === 'general' ? 'general' : 'piano';
+    const bpm = parseBpm(req.body?.bpm);
+    const arrangement = req.body?.arrangement === 'expanded'
+      ? 'expanded'
+      : req.body?.arrangement === 'composer'
+        ? 'composer'
+        : 'off';
     if (!url) return res.status(400).json({ error: 'A YouTube URL is required.' });
 
     let parsed: URL;
@@ -253,25 +369,59 @@ app.post('/api/audio/transcribe-url', async (req, res) => {
       return res.status(400).json({ error: 'Only YouTube URLs are supported.' });
     }
 
-    const result = await runAudioTranscription(['--url', url, '--mode', mode]);
-    res.setHeader('Content-Type', 'audio/midi');
-    res.setHeader('Content-Disposition', 'attachment; filename="transcription.mid"');
-    if (result.title) res.setHeader('X-Motif-Title', encodeURIComponent(result.title));
-    if (result.arrangement) res.setHeader('X-Motif-Arrangement', result.arrangement);
-    res.send(result.midi);
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'motif-transcribe-'));
+    const args = ['--url', url, '--mode', mode, '--arrange', arrangement];
+    if (bpm !== undefined) args.push('--bpm', String(bpm));
+    const job = startTranscriptionJob(
+      args,
+      workDir
+    );
+    res.json({ jobId: job.id });
   } catch (error) {
     sendTranscriptionError(res, error);
   }
+});
+
+app.get('/api/audio/transcription/:jobId', (req, res) => {
+  const job = transcriptionJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Transcription job not found.' });
+  res.json({
+    status: job.status,
+    percent: job.percent,
+    label: job.label,
+    error: job.error,
+  });
+});
+
+app.get('/api/audio/transcription/:jobId/result', (req, res) => {
+  const job = transcriptionJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Transcription job not found.' });
+  if (job.status === 'error') return res.status(500).json({ error: job.error });
+  if (job.status !== 'done' || !job.result) {
+    return res.status(409).json({ error: 'Transcription is still running.' });
+  }
+  res.setHeader('Content-Type', 'audio/midi');
+  res.setHeader('Content-Disposition', 'attachment; filename="transcription.mid"');
+  if (job.result.title) res.setHeader('X-Motif-Title', encodeURIComponent(job.result.title));
+  if (job.result.arrangement) res.setHeader('X-Motif-Arrangement', job.result.arrangement);
+  if (job.result.bpm !== undefined) res.setHeader('X-Motif-Bpm', String(job.result.bpm));
+  if (job.result.bpmSource) res.setHeader('X-Motif-Bpm-Source', job.result.bpmSource);
+  res.send(job.result.midi);
 });
 
 app.post(
   '/api/audio/transcribe-upload',
   express.raw({ type: 'application/octet-stream', limit: '150mb' }),
   async (req, res) => {
-    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'motif-upload-'));
     try {
       const requestedName = String(req.query.filename || 'upload.wav');
       const mode = req.query.mode === 'general' ? 'general' : 'piano';
+      const bpm = parseBpm(req.query.bpm);
+      const arrangement = req.query.arrangement === 'expanded'
+        ? 'expanded'
+        : req.query.arrangement === 'composer'
+          ? 'composer'
+          : 'off';
       const extension = path.extname(requestedName).toLowerCase();
       const allowedExtensions = new Set(['.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac', '.webm', '.mp4']);
       if (!allowedExtensions.has(extension)) {
@@ -281,19 +431,21 @@ app.post(
         return res.status(400).json({ error: 'The uploaded audio file is empty.' });
       }
 
+      // The upload lives in the job's work dir so job cleanup removes it.
+      const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'motif-upload-'));
       const inputPath = path.join(workDir, `upload${extension}`);
       await fs.writeFile(inputPath, req.body);
-      const result = await runAudioTranscription(['--input', inputPath, '--mode', mode]);
-      res.setHeader('Content-Type', 'audio/midi');
-      res.setHeader('Content-Disposition', 'attachment; filename="transcription.mid"');
       const uploadTitle = path.parse(requestedName).name.slice(0, 300);
-      res.setHeader('X-Motif-Title', encodeURIComponent(uploadTitle));
-      if (result.arrangement) res.setHeader('X-Motif-Arrangement', result.arrangement);
-      res.send(result.midi);
+      const args = ['--input', inputPath, '--mode', mode, '--arrange', arrangement];
+      if (bpm !== undefined) args.push('--bpm', String(bpm));
+      const job = startTranscriptionJob(
+        args,
+        workDir,
+        uploadTitle
+      );
+      res.json({ jobId: job.id });
     } catch (error) {
       sendTranscriptionError(res, error);
-    } finally {
-      await fs.rm(workDir, { recursive: true, force: true });
     }
   }
 );

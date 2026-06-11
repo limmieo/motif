@@ -8,6 +8,7 @@ import { unlockAudio } from '../utils/audioUnlock';
 
 export interface GenerationOptions {
   lightweightMode?: boolean;
+  arrangementMode?: 'original' | 'composer' | 'expanded';
 }
 
 export class MotifEngine {
@@ -42,8 +43,11 @@ export class MotifEngine {
     }
 
     const lightweightMode = options.lightweightMode === true;
+    const arrangementMode = options.arrangementMode;
+    const composerArrangement = arrangementMode === 'composer' || arrangementMode === 'expanded';
     this.synthesisEngine = new SynthesisEngine(this.audioContext, this.config, {
       compressionEnabled: lightweightMode,
+      cleanArrangement: composerArrangement,
     });
 
     if (transformMode === 'passthrough') {
@@ -72,11 +76,75 @@ export class MotifEngine {
       console.log('Motif: Passthrough mode - playing original MIDI patterns');
     } else {
       // Procedural mode - transform the MIDI with role mapping
-      const roleAssignments = this.looksLikeSoloPiano(events)
-        ? this.arrangeSoloPiano(events, lightweightMode)
-        : this.roleMapper.assignRoles(this.midiProcessor.extractFeatures(events), events);
+      const clonedEvents = events.map(event => ({ ...event }));
+      const roleAssignments = composerArrangement
+        ? this.arrangeComposerTracks(clonedEvents, lightweightMode, arrangementMode)
+        : this.looksLikeSoloPiano(clonedEvents)
+          ? this.arrangeSoloPiano(clonedEvents, lightweightMode)
+          : this.roleMapper.assignRoles(this.midiProcessor.extractFeatures(clonedEvents), clonedEvents);
       this.synthesisEngine.setupLayers(roleAssignments);
       console.log('Motif: Procedural mode - transforming MIDI with role mapping');
+    }
+  }
+
+  private arrangeComposerTracks(
+    events: NoteEvent[],
+    lightweightMode: boolean,
+    arrangementMode: 'composer' | 'expanded'
+  ): RoleAssignment[] {
+    const trackIds = [...new Set(events.map(event => event.track))].sort((a, b) => a - b);
+    const roles: Role[] = arrangementMode === 'expanded'
+      ? ['melody', 'bass', 'texture', 'ostinato']
+      : ['melody', 'bass', 'texture'];
+    const assignments: RoleAssignment[] = [];
+    const trackLimit = lightweightMode ? 3 : roles.length;
+
+    for (let index = 0; index < Math.min(trackIds.length, trackLimit); index++) {
+      const role = roles[index];
+      const voiceEvents = events
+        .filter(event => event.track === trackIds[index])
+        .sort((a, b) => a.time - b.time || a.pitch - b.pitch);
+      if (voiceEvents.length === 0) continue;
+
+      this.cleanComposerVoice(voiceEvents, role, lightweightMode);
+      assignments.push({
+        role,
+        sourceTrack: trackIds[index],
+        events: voiceEvents,
+        chords: [],
+        confidence: 1,
+        features: this.describeVoice(voiceEvents),
+      });
+    }
+
+    return assignments;
+  }
+
+  private cleanComposerVoice(events: NoteEvent[], role: Role, lightweightMode: boolean): void {
+    const velocityScale = role === 'bass'
+      ? 0.78
+      : role === 'texture' || role === 'ostinato'
+        ? 0.6
+        : 0.9;
+    for (const event of events) {
+      event.velocity *= velocityScale;
+    }
+
+    this.trimVoiceOverlap(events, role, true);
+    for (let index = 0; index < events.length - 1; index++) {
+      const event = events[index];
+      const next = events[index + 1];
+      const gap = next.time - event.time;
+      if (gap <= 0) continue;
+
+      const gate = lightweightMode
+        ? 0.68
+        : role === 'melody'
+          ? 0.9
+          : role === 'bass'
+            ? 0.76
+            : 0.58;
+      event.duration = Math.min(event.duration, Math.max(0.06, gap * gate));
     }
   }
 

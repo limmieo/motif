@@ -1,5 +1,5 @@
 import { MotifEngine } from './core/MotifEngine';
-import { MIDIService } from './services/MIDIService';
+import { MIDIService, type AudioTranscriptionProgress } from './services/MIDIService';
 import { MIDIParser } from './midi/MIDIParser';
 import { SoundfontMIDIPlayer } from './synthesis/SoundfontMIDIPlayer';
 import { getAudioContext, isAudioReady, peekAudioContext, unlockAudio } from './utils/audioUnlock';
@@ -17,9 +17,17 @@ class MotifApp {
   private songInput!: HTMLInputElement;
   private audioUrlInput!: HTMLInputElement;
   private transcriptionMode!: HTMLSelectElement;
+  private transcriptionArrangement!: HTMLSelectElement;
+  private transcriptionBpm!: HTMLInputElement;
+  private arrangementHelp!: HTMLElement;
   private transcribeUrlBtn!: HTMLButtonElement;
   private audioFileInput!: HTMLInputElement;
   private chooseAudioBtn!: HTMLButtonElement;
+  private transcriptionProgress!: HTMLElement;
+  private transcriptionProgressFill!: HTMLElement;
+  private transcriptionProgressLabel!: HTMLElement;
+  private transcriptionProgressPercent!: HTMLElement;
+  private transcriptionProgressHideTimeout: number | null = null;
   private status!: HTMLElement;
   
   private resultsSection!: HTMLElement;
@@ -111,9 +119,16 @@ class MotifApp {
     this.songInput = document.getElementById('songInput') as HTMLInputElement;
     this.audioUrlInput = document.getElementById('audioUrlInput') as HTMLInputElement;
     this.transcriptionMode = document.getElementById('transcriptionMode') as HTMLSelectElement;
+    this.transcriptionArrangement = document.getElementById('transcriptionArrangement') as HTMLSelectElement;
+    this.transcriptionBpm = document.getElementById('transcriptionBpm') as HTMLInputElement;
+    this.arrangementHelp = document.getElementById('arrangementHelp')!;
     this.transcribeUrlBtn = document.getElementById('transcribeUrlBtn') as HTMLButtonElement;
     this.audioFileInput = document.getElementById('audioFileInput') as HTMLInputElement;
     this.chooseAudioBtn = document.getElementById('chooseAudioBtn') as HTMLButtonElement;
+    this.transcriptionProgress = document.getElementById('transcriptionProgress')!;
+    this.transcriptionProgressFill = document.getElementById('transcriptionProgressFill')!;
+    this.transcriptionProgressLabel = document.getElementById('transcriptionProgressLabel')!;
+    this.transcriptionProgressPercent = document.getElementById('transcriptionProgressPercent')!;
     this.status = document.getElementById('status')!;
 
     this.resultsSection = document.getElementById('resultsSection')!;
@@ -224,6 +239,8 @@ class MotifApp {
     this.faqBackdrop.addEventListener('click', (e) => {
       if (e.target === this.faqBackdrop) this.closeFaq();
     });
+    this.transcriptionArrangement.addEventListener('change', () => this.updateArrangementHelp());
+    this.updateArrangementHelp();
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') this.closeFaq();
     });
@@ -236,14 +253,26 @@ class MotifApp {
       return;
     }
     await this.runTranscription(
-      () => this.midiService.transcribeYouTube(url, this.getTranscriptionMode()),
+      onProgress => this.midiService.transcribeYouTube(
+        url,
+        this.getTranscriptionMode(),
+        this.getTranscriptionArrangement(),
+        this.getTranscriptionBpm(),
+        onProgress
+      ),
       'YouTube transcription'
     );
   }
 
   private async handleAudioUpload(file: File): Promise<void> {
     await this.runTranscription(
-      () => this.midiService.transcribeAudioFile(file, this.getTranscriptionMode()),
+      onProgress => this.midiService.transcribeAudioFile(
+        file,
+        this.getTranscriptionMode(),
+        this.getTranscriptionArrangement(),
+        this.getTranscriptionBpm(),
+        onProgress
+      ),
       file.name.replace(/\.[^.]+$/, '') || 'Audio transcription'
     );
     this.audioFileInput.value = '';
@@ -253,45 +282,127 @@ class MotifApp {
     return this.transcriptionMode.value === 'general' ? 'general' : 'piano';
   }
 
+  private getTranscriptionArrangement(): 'off' | 'composer' | 'expanded' {
+    if (this.transcriptionArrangement.value === 'expanded') return 'expanded';
+    if (this.transcriptionArrangement.value === 'composer') return 'composer';
+    return 'off';
+  }
+
+  private getTranscriptionBpm(): number | undefined {
+    const value = this.transcriptionBpm.value.trim();
+    if (!value) return undefined;
+    const bpm = Number(value);
+    if (!Number.isFinite(bpm) || bpm < 40 || bpm > 240) {
+      throw new Error('Song speed must be between 40 and 240 BPM.');
+    }
+    return bpm;
+  }
+
+  private updateArrangementHelp(): void {
+    const arrangement = this.getTranscriptionArrangement();
+    this.arrangementHelp.textContent = arrangement === 'expanded'
+      ? 'Keeps the main tune, bass, and two smoother background parts. It follows nearby chords to avoid awkward note jumps.'
+      : arrangement === 'composer'
+        ? 'Keeps only the most important parts. This sounds more retro, but it may leave out notes from the song.'
+        : 'Keeps every note the computer can hear. Start here for the most accurate result.';
+  }
+
   private async runTranscription(
-    load: () => Promise<{ midi: ArrayBuffer; title?: string; arrangement?: string }>,
+    load: (
+      onProgress: (progress: AudioTranscriptionProgress) => void
+    ) => Promise<{
+      midi: ArrayBuffer;
+      title?: string;
+      arrangement?: string;
+      bpm?: number;
+      bpmSource?: string;
+    }>,
     fallbackTitle: string
   ): Promise<void> {
     this.transcribeUrlBtn.disabled = true;
     this.chooseAudioBtn.disabled = true;
     const modeLabel = this.getTranscriptionMode() === 'piano' ? 'piano model' : 'general model';
     this.updateStatus(`Transcribing with the ${modeLabel}. This can take several minutes...`);
+    this.showTranscriptionProgress();
     this.handleMotifStop();
     this.stopPreview();
 
     try {
-      const transcription = await load();
+      const transcription = await load(progress => {
+        this.updateTranscriptionProgress(progress.percent, progress.label);
+        this.updateStatus(`${progress.label} (${progress.percent}%)`);
+      });
       const midiBuffer = transcription.midi;
       const title = transcription.title || fallbackTitle;
       const events = MIDIParser.parseMIDI(midiBuffer);
       if (events.length === 0) throw new Error('The transcription contained no playable notes.');
       const metadata = MIDIParser.getMIDIInfo(midiBuffer);
       const duration = Math.max(...events.map(event => event.time + event.duration));
-      this.currentMIDI = { events, metadata: { ...metadata, duration } };
+      this.currentMIDI = {
+        events,
+        metadata: {
+          ...metadata,
+          duration,
+          arrangement: transcription.arrangement,
+          bpm: transcription.bpm,
+          bpmSource: transcription.bpmSource,
+        },
+      };
       this.currentMIDIIsShareable = false;
       this.hasGenerated = false;
       this.selectedTitle.textContent = this.cleanSongTitle(title);
-      this.selectedMeta.textContent = transcription.arrangement === 'composer'
-        ? 'Source: automatic audio transcription, arranged for Game Boy voices (melody / bass / arpeggio)'
-        : 'Source: automatic audio transcription (results may need cleanup)';
+      const arrangementLabel = transcription.arrangement === 'expanded'
+        ? 'Audio converted with the Fuller Game Boy remix setting'
+        : transcription.arrangement === 'composer'
+          ? 'Audio converted with the Simple retro remix setting'
+          : 'Audio converted with the Closest to the original song setting';
+      const bpmLabel = transcription.bpm === undefined
+        ? ''
+        : ` | Timing: ${transcription.bpm} BPM (${
+          transcription.bpmSource === 'manual' ? 'entered' : 'auto-detected'
+        })`;
+      this.selectedMeta.textContent = arrangementLabel + bpmLabel;
       this.enablePlayerControls();
       this.copyLinkBtn.disabled = true;
       this.updateIOSAudioBanner();
       this.setState('selected');
       this.resultsSection.classList.remove('visible');
+      this.updateTranscriptionProgress(100, 'MIDI ready');
+      this.scheduleTranscriptionProgressHide(1400);
       this.updateStatus('MIDI created. Preview it, then generate the Game Boy version.');
       this.playerSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
     } catch (error) {
+      this.updateTranscriptionProgress(100, 'Transcription failed');
+      this.scheduleTranscriptionProgressHide(3000);
       this.updateStatus(`Transcription error: ${error instanceof Error ? error.message : 'Unknown error'}`);
     } finally {
       this.transcribeUrlBtn.disabled = false;
       this.chooseAudioBtn.disabled = false;
     }
+  }
+
+  private showTranscriptionProgress(): void {
+    if (this.transcriptionProgressHideTimeout !== null) {
+      window.clearTimeout(this.transcriptionProgressHideTimeout);
+      this.transcriptionProgressHideTimeout = null;
+    }
+    this.transcriptionProgress.hidden = false;
+    this.updateTranscriptionProgress(0, 'Starting transcription');
+  }
+
+  private updateTranscriptionProgress(percent: number, label: string): void {
+    const safePercent = Math.max(0, Math.min(100, Math.round(percent)));
+    this.transcriptionProgressFill.style.width = `${safePercent}%`;
+    this.transcriptionProgress.setAttribute('aria-valuenow', String(safePercent));
+    this.transcriptionProgressLabel.textContent = label;
+    this.transcriptionProgressPercent.textContent = `${safePercent}%`;
+  }
+
+  private scheduleTranscriptionProgressHide(delayMs: number): void {
+    this.transcriptionProgressHideTimeout = window.setTimeout(() => {
+      this.transcriptionProgress.hidden = true;
+      this.transcriptionProgressHideTimeout = null;
+    }, delayMs);
   }
 
   private openFaq(): void {
@@ -605,9 +716,21 @@ class MotifApp {
       this.playPauseBtn.disabled = true;
 
       // Generate a variation using the procedural role-mapping mode
-      await this.motifEngine.generateFromMIDI(this.currentMIDI.events, 'procedural', {
-        lightweightMode: this.lightweightMode.checked,
-      });
+      const arrangementMode = this.currentMIDI.metadata?.arrangement as
+        | 'original'
+        | 'composer'
+        | 'expanded'
+        | undefined;
+      await this.motifEngine.generateFromMIDI(
+        this.currentMIDI.events,
+        arrangementMode === 'original' && !this.lightweightMode.checked
+          ? 'passthrough'
+          : 'procedural',
+        {
+          lightweightMode: this.lightweightMode.checked,
+          arrangementMode,
+        }
+      );
       this.motifEngine.setVolume(0.8);
 
       await this.motifEngine.play();

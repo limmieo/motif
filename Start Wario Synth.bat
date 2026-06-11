@@ -46,11 +46,26 @@ if not exist "server\models\piano-note-pedal.pth" (
     if errorlevel 1 goto :error
 )
 
-powershell -NoProfile -WindowStyle Hidden -Command ^
-  "Start-Process -WindowStyle Hidden -FilePath 'npm.cmd' -ArgumentList 'run','dev:backend' -WorkingDirectory '%~dp0'"
+set "BACKEND_READY=0"
+set "FRONTEND_READY=0"
 
-powershell -NoProfile -WindowStyle Hidden -Command ^
-  "Start-Process -WindowStyle Hidden -FilePath 'npm.cmd' -ArgumentList 'run','dev','--','--host','127.0.0.1' -WorkingDirectory '%~dp0'"
+powershell -NoProfile -Command ^
+  "try { $r=Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 'http://127.0.0.1:3001/health'; if ($r.StatusCode -eq 200) { exit 0 } } catch {}; exit 1"
+if not errorlevel 1 set "BACKEND_READY=1"
+
+powershell -NoProfile -Command ^
+  "try { $r=Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 'http://127.0.0.1:3000'; if ($r.StatusCode -eq 200) { exit 0 } } catch {}; exit 1"
+if not errorlevel 1 set "FRONTEND_READY=1"
+
+if "%BACKEND_READY%"=="0" (
+    powershell -NoProfile -WindowStyle Hidden -Command ^
+      "Start-Process -WindowStyle Hidden -FilePath 'npm.cmd' -ArgumentList 'run','dev:backend' -WorkingDirectory '%~dp0'"
+)
+
+if "%FRONTEND_READY%"=="0" (
+    powershell -NoProfile -WindowStyle Hidden -Command ^
+      "Start-Process -WindowStyle Hidden -FilePath 'npm.cmd' -ArgumentList 'run','dev','--','--host','127.0.0.1','--port','3000' -WorkingDirectory '%~dp0'"
+)
 
 echo Waiting for Wario Synth...
 powershell -NoProfile -Command ^

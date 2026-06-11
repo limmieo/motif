@@ -27,12 +27,40 @@ MAX_QUANTIZE_SHIFT_SECONDS = 0.045
 ARRANGE_ONSET_EPSILON_SECONDS = 0.06
 MELODY_BASS_MIN_GAP_SEMITONES = 7
 DENSE_ONSET_RATIO = 0.1
-ARPEGGIO_MAX_PITCHES = 4
+ARPEGGIO_MAX_PITCHES = 2
+ARPEGGIO_VELOCITY_SCALE = 0.45
+ARPEGGIO_GATE_RATIO = 0.55
+BASS_VELOCITY_SCALE = 0.72
+MELODY_OUTPUT_RANGE = (55, 81)
+BASS_OUTPUT_RANGE = (31, 52)
+ARPEGGIO_OUTPUT_RANGE = (48, 72)
+HARMONY_LOW_OUTPUT_RANGE = (43, 67)
+HARMONY_HIGH_OUTPUT_RANGE = (52, 76)
+
+# Full-mix transcriptions are noisy: harmonics show up as weak notes an
+# octave or two above the real melody, and quiet artifacts clutter the
+# texture. These thresholds reject them without touching confident notes.
+NOISE_VELOCITY_RATIO = 0.4
+NOISE_MAX_DURATION_SECONDS = 0.12
+MELODY_MAX_LEAP_SEMITONES = 12
+MELODY_SPIKE_MAX_DURATION_SECONDS = 0.2
+MELODY_EMA_WEIGHT = 0.25
+BASS_MAX_PITCH = 55
+INNER_VELOCITY_RATIO = 0.45
+STUCK_HIGH_MIN_PITCH = 84
+STUCK_HIGH_MIN_DURATION_SECONDS = 1.2
+STUCK_HIGH_MIN_LOWER_ONSETS = 4
+STUCK_HIGH_MIN_INTERVAL_SEMITONES = 7
 
 MAJOR_PROFILE = (6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88)
 MINOR_PROFILE = (6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17)
 MAJOR_INTERVALS = {0, 2, 4, 5, 7, 9, 11}
 MINOR_INTERVALS = {0, 2, 3, 5, 7, 8, 10}
+
+
+def report_progress(percent: int, label: str) -> None:
+    """Emit a machine-readable progress line for the Node server to relay."""
+    print("PROGRESS " + json.dumps({"percent": percent, "label": label}), flush=True)
 
 
 def find_ffmpeg() -> str:
@@ -111,17 +139,51 @@ def convert_to_wav(source: Path, target: Path, ffmpeg_path: str) -> None:
         raise RuntimeError(f"Audio conversion failed: {detail[0]}")
 
 
-def transcribe(source: Path, output: Path, mode: str) -> None:
+def detect_audio_tempo(source: Path) -> float | None:
+    """Estimate a stable song tempo from the normalized source audio."""
+    try:
+        import librosa
+        import numpy as np
+
+        audio, sample_rate = librosa.load(str(source), sr=22050, mono=True)
+        if len(audio) < sample_rate * 3:
+            return None
+
+        onset_envelope = librosa.onset.onset_strength(
+            y=audio,
+            sr=sample_rate,
+            aggregate=np.median,
+        )
+        tempo, beat_frames = librosa.beat.beat_track(
+            onset_envelope=onset_envelope,
+            sr=sample_rate,
+        )
+        tempo_values = np.asarray(tempo).reshape(-1)
+        if tempo_values.size == 0 or len(beat_frames) < 4:
+            return None
+
+        detected = float(tempo_values[0])
+        if not math.isfinite(detected) or not 40 <= detected <= 240:
+            return None
+        return round(detected, 1)
+    except Exception as error:
+        print(f"Tempo detection skipped: {error}", file=sys.stderr)
+        return None
+
+
+def transcribe(source: Path, output: Path, mode: str, tempo_override: float | None = None) -> None:
     if mode == "piano":
-        transcribe_piano(source, output)
+        transcribe_piano(source, output, tempo_override)
         return
 
-    transcribe_general(source, output)
+    transcribe_general(source, output, tempo_override)
 
 
-def transcribe_general(source: Path, output: Path) -> None:
+def transcribe_general(source: Path, output: Path, tempo_override: float | None = None) -> None:
+    report_progress(35, "Loading the transcription model")
     from basic_pitch.inference import predict
 
+    report_progress(45, "Listening for notes (the long part)")
     _, midi_data, note_events = predict(
         str(source),
         onset_threshold=0.58,
@@ -135,12 +197,14 @@ def transcribe_general(source: Path, output: Path) -> None:
     if not note_events:
         raise RuntimeError("No clear musical notes were detected in this audio.")
 
-    clean_midi(midi_data)
+    report_progress(88, "Cleaning up the notes")
+    clean_midi(midi_data, tempo_override)
     output.parent.mkdir(parents=True, exist_ok=True)
     midi_data.write(str(output))
 
 
-def transcribe_piano(source: Path, output: Path) -> None:
+def transcribe_piano(source: Path, output: Path, tempo_override: float | None = None) -> None:
+    report_progress(35, "Loading the piano model")
     import librosa
     import pretty_midi
     import torch
@@ -160,13 +224,24 @@ def transcribe_piano(source: Path, output: Path) -> None:
         checkpoint_path=str(checkpoint),
     )
     output.parent.mkdir(parents=True, exist_ok=True)
+    report_progress(45, "Transcribing piano audio (the long part)")
     result = transcriber.transcribe(audio, str(output))
     if not result.get("est_note_events"):
         raise RuntimeError("The piano model did not detect any notes.")
 
+    report_progress(88, "Cleaning up the notes")
     midi_data = pretty_midi.PrettyMIDI(str(output))
     apply_pedal_sustain(midi_data, result.get("est_pedal_events", []))
     clean_piano_midi(midi_data, len(audio) / sample_rate)
+    if tempo_override is not None:
+        notes = [
+            note
+            for instrument in midi_data.instruments
+            if not instrument.is_drum
+            for note in instrument.notes
+        ]
+        if notes:
+            quantize_near_grid(midi_data, notes, tempo_override)
     midi_data.write(str(output))
 
 
@@ -217,7 +292,7 @@ def clean_piano_midi(midi_data, audio_duration: float) -> None:
         instrument.notes.sort(key=lambda note: (note.start, note.pitch, note.end))
 
 
-def clean_midi(midi_data) -> None:
+def clean_midi(midi_data, tempo_override: float | None = None) -> None:
     """Reduce transcription noise before the four-channel Game Boy arranger."""
     for instrument in midi_data.instruments:
         candidates = [
@@ -268,10 +343,10 @@ def clean_midi(midi_data) -> None:
         ]
         repair_note_timing(instrument.notes)
 
-    apply_music_intelligence(midi_data)
+    apply_music_intelligence(midi_data, tempo_override)
 
 
-def apply_music_intelligence(midi_data) -> None:
+def apply_music_intelligence(midi_data, tempo_override: float | None = None) -> None:
     """Apply conservative key, rhythm, and voice-leading corrections."""
     notes = [
         note
@@ -288,7 +363,8 @@ def apply_music_intelligence(midi_data) -> None:
         if confidence >= 0.035:
             correct_likely_pitch_errors(notes, tonic, mode)
 
-    quantize_near_grid(midi_data, notes, estimate_tempo(midi_data, notes))
+    tempo = tempo_override if tempo_override is not None else estimate_tempo(midi_data, notes)
+    quantize_near_grid(midi_data, notes, tempo)
 
 
 def infer_key(notes):
@@ -449,17 +525,29 @@ def repair_note_timing(notes) -> None:
     notes[:] = sorted(merged, key=lambda note: (note.start, note.pitch, note.end))
 
 
-def apply_composer_arrangement(midi_path: Path) -> bool:
+def apply_composer_arrangement(
+    midi_path: Path,
+    expanded: bool = False,
+    tempo_override: float | None = None,
+) -> bool:
     import pretty_midi
 
     midi_data = pretty_midi.PrettyMIDI(str(midi_path))
-    if not arrange_for_game_boy(midi_data):
+    if not arrange_for_game_boy(
+        midi_data,
+        expanded=expanded,
+        tempo_override=tempo_override,
+    ):
         return False
     midi_data.write(str(midi_path))
     return True
 
 
-def arrange_for_game_boy(midi_data) -> bool:
+def arrange_for_game_boy(
+    midi_data,
+    expanded: bool = False,
+    tempo_override: float | None = None,
+) -> bool:
     """Composer Mode: rewrite dense polyphony as separate Game Boy voices.
 
     A ten-note piano chord cannot play on Game Boy hardware (two pulse
@@ -478,6 +566,8 @@ def arrange_for_game_boy(midi_data) -> bool:
         ),
         key=lambda note: (note.start, -note.pitch, note.end),
     )
+    notes = drop_noise_floor(notes)
+    notes = drop_stuck_high_tones(notes)
     if len(notes) < 8 or not is_dense_polyphony(notes):
         return False
 
@@ -485,10 +575,38 @@ def arrange_for_game_boy(midi_data) -> bool:
     if not melody:
         return False
 
-    arpeggio = arpeggiate_inner_voices(inner, estimate_tempo(midi_data, notes))
+    scale = None
+    key = infer_key(notes)
+    if key is not None:
+        tonic, mode, confidence = key
+        if confidence >= 0.02:
+            intervals = MAJOR_INTERVALS if mode == "major" else MINOR_INTERVALS
+            scale = {(tonic + interval) % 12 for interval in intervals}
+
+    fit_voice_register(melody, *MELODY_OUTPUT_RANGE)
+    fit_voice_register(bass, *BASS_OUTPUT_RANGE)
+    scale_voice_velocity(bass, BASS_VELOCITY_SCALE)
+
+    if expanded:
+        harmony_low, harmony_high = split_harmony_voices(inner, scale)
+        fit_voice_register(harmony_low, *HARMONY_LOW_OUTPUT_RANGE)
+        fit_voice_register(harmony_high, *HARMONY_HIGH_OUTPUT_RANGE)
+        scale_voice_velocity(harmony_low, 0.62)
+        scale_voice_velocity(harmony_high, 0.58)
+        named_voices = (
+            ("Melody", melody),
+            ("Bass", bass),
+            ("Harmony Low", harmony_low),
+            ("Harmony High", harmony_high),
+        )
+    else:
+        tempo = tempo_override if tempo_override is not None else estimate_tempo(midi_data, notes)
+        arpeggio = arpeggiate_inner_voices(inner, tempo, scale)
+        fit_voice_register(arpeggio, *ARPEGGIO_OUTPUT_RANGE)
+        named_voices = (("Melody", melody), ("Bass", bass), ("Arpeggio", arpeggio))
 
     instruments = []
-    for name, voice in (("Melody", melody), ("Bass", bass), ("Arpeggio", arpeggio)):
+    for name, voice in named_voices:
         if not voice:
             continue
         instrument = pretty_midi.Instrument(program=0, name=name)
@@ -516,11 +634,71 @@ def is_dense_polyphony(notes) -> bool:
     return dense_onsets / len(onsets) >= DENSE_ONSET_RATIO
 
 
+def drop_noise_floor(notes):
+    """Discard weak, short detections — typical full-mix transcription noise."""
+    if len(notes) < 12:
+        return notes
+    median_velocity = statistics.median(note.velocity for note in notes)
+    return [
+        note
+        for note in notes
+        if not (
+            note.velocity < median_velocity * NOISE_VELOCITY_RATIO
+            and note.end - note.start <= NOISE_MAX_DURATION_SECONDS
+        )
+    ]
+
+
+def drop_stuck_high_tones(notes):
+    """Remove long high spectral lines that sit above changing real notes."""
+    if len(notes) < 12:
+        return notes
+
+    median_velocity = statistics.median(note.velocity for note in notes)
+    filtered = []
+    for note in notes:
+        duration = note.end - note.start
+        if note.pitch < STUCK_HIGH_MIN_PITCH or duration < STUCK_HIGH_MIN_DURATION_SECONDS:
+            filtered.append(note)
+            continue
+
+        lower_onsets = {
+            round(other.start / ARRANGE_ONSET_EPSILON_SECONDS)
+            for other in notes
+            if other is not note
+            and note.start <= other.start < note.end
+            and note.pitch - other.pitch >= STUCK_HIGH_MIN_INTERVAL_SEMITONES
+        }
+        is_confident_lead = note.velocity >= median_velocity * 1.35
+        if len(lower_onsets) < STUCK_HIGH_MIN_LOWER_ONSETS or is_confident_lead:
+            filtered.append(note)
+
+    return filtered
+
+
+def is_melody_spike(note, melody_center, median_velocity) -> bool:
+    """Detect short or weak notes leaping far above the established melody.
+
+    On full mixes the transcriber hears overtones as real notes an octave or
+    two above the tune; a naive skyline hands them the lead. A genuine
+    register change is sustained and confident, a harmonic is not.
+    """
+    if melody_center is None:
+        return False
+    if note.pitch - melody_center <= MELODY_MAX_LEAP_SEMITONES:
+        return False
+    return (
+        note.end - note.start < MELODY_SPIKE_MAX_DURATION_SECONDS
+        or note.velocity < median_velocity
+    )
+
+
 def separate_voices(notes):
     """Split notes into melody (skyline), bass (floor), and inner voices."""
     melody = []
     bass = []
     inner = []
+    median_velocity = statistics.median(note.velocity for note in notes)
 
     clusters = []
     for note in notes:
@@ -529,27 +707,47 @@ def separate_voices(notes):
         else:
             clusters.append([note])
 
+    melody_center = None
     for cluster in clusters:
         cluster.sort(key=lambda note: (-note.pitch, -note.velocity))
-        remaining = list(cluster)
+        # Harmonic spikes are artifacts: drop them entirely rather than
+        # letting them lead the melody or clutter the arpeggio.
+        remaining = [
+            note
+            for note in cluster
+            if not is_melody_spike(note, melody_center, median_velocity)
+        ]
+        if not remaining:
+            continue
 
         # The top of the cluster leads unless a sustained melody note still
-        # rings above it, in which case the whole cluster is accompaniment.
+        # rings above a multi-note chord. A single following note is usually
+        # the next step of a melodic arpeggio, so it must replace the held note
+        # instead of disappearing underneath it.
         top = remaining[0]
         held_melody = melody[-1] if melody else None
         melody_is_held = (
             held_melody is not None
+            and len(remaining) > 1
             and held_melody.end > top.start + ARRANGE_ONSET_EPSILON_SECONDS
             and held_melody.pitch > top.pitch
         )
         if not melody_is_held:
             melody.append(top)
             remaining = remaining[1:]
+            melody_center = (
+                float(top.pitch)
+                if melody_center is None
+                else melody_center + MELODY_EMA_WEIGHT * (top.pitch - melody_center)
+            )
 
         if remaining:
             low = remaining[-1]
             reference = melody[-1].pitch if melody else top.pitch
-            if reference - low.pitch >= MELODY_BASS_MIN_GAP_SEMITONES:
+            if (
+                reference - low.pitch >= MELODY_BASS_MIN_GAP_SEMITONES
+                and low.pitch <= BASS_MAX_PITCH
+            ):
                 bass.append(low)
                 remaining = remaining[:-1]
 
@@ -571,10 +769,118 @@ def enforce_monophony(voice) -> None:
     ]
 
 
-def arpeggiate_inner_voices(inner, tempo: float):
+def fit_voice_register(voice, low: int, high: int) -> None:
+    """Octave-fold a voice into a comfortable Game Boy register."""
+    for note in voice:
+        while note.pitch > high:
+            note.pitch -= 12
+        while note.pitch < low:
+            note.pitch += 12
+
+
+def scale_voice_velocity(voice, scale: float) -> None:
+    for note in voice:
+        note.velocity = max(1, min(127, round(note.velocity * scale)))
+
+
+def split_harmony_voices(inner, scale=None):
+    """Keep two smooth independent inner lines for expanded four-voice mode."""
+    if not inner:
+        return [], []
+
+    median_velocity = statistics.median(note.velocity for note in inner)
+    candidates = [
+        note
+        for note in inner
+        if note.velocity >= median_velocity * INNER_VELOCITY_RATIO
+    ]
+    clusters = []
+    for note in sorted(candidates, key=lambda item: (item.start, item.pitch)):
+        if clusters and note.start - clusters[-1][0].start <= ARRANGE_ONSET_EPSILON_SECONDS:
+            clusters[-1].append(note)
+        else:
+            clusters.append([note])
+
+    low_voice = []
+    high_voice = []
+    for cluster in clusters:
+        pitches = sorted(cluster, key=lambda note: (note.pitch, -note.velocity))
+        if scale:
+            in_scale = [note for note in pitches if note.pitch % 12 in scale]
+            if in_scale:
+                pitches = in_scale
+
+        # Same-pitch re-strikes inside one onset window are a single harmony
+        # note, not a pair — route them by unique pitch count or the pair
+        # chooser has nothing to pair.
+        if len({note.pitch for note in pitches}) == 1:
+            note = max(pitches, key=lambda item: item.velocity)
+            low_distance = abs(note.pitch - low_voice[-1].pitch) if low_voice else float("inf")
+            high_distance = abs(note.pitch - high_voice[-1].pitch) if high_voice else float("inf")
+            (low_voice if low_distance <= high_distance else high_voice).append(note)
+            continue
+
+        previous_low = low_voice[-1] if low_voice else None
+        previous_high = high_voice[-1] if high_voice else None
+        low, high = choose_smooth_harmony_pair(pitches, previous_low, previous_high)
+        low_voice.append(low)
+        high_voice.append(high)
+
+    enforce_monophony(low_voice)
+    enforce_monophony(high_voice)
+    return low_voice, high_voice
+
+
+def choose_smooth_harmony_pair(notes, previous_low=None, previous_high=None):
+    """Choose two detected chord notes with minimal voice-leading motion."""
+    by_pitch = {}
+    for note in notes:
+        existing = by_pitch.get(note.pitch)
+        if existing is None or note.velocity > existing.velocity:
+            by_pitch[note.pitch] = note
+    unique = sorted(by_pitch.values(), key=lambda note: note.pitch)
+    if len(unique) < 2:
+        raise ValueError("At least two harmony notes are required.")
+
+    if previous_low is None or previous_high is None:
+        return unique[0], unique[-1]
+
+    candidates = []
+    for low_index, low in enumerate(unique[:-1]):
+        for high in unique[low_index + 1:]:
+            spacing = high.pitch - low.pitch
+            movement = abs(low.pitch - previous_low.pitch) + abs(high.pitch - previous_high.pitch)
+            leap_penalty = (
+                max(0, abs(low.pitch - previous_low.pitch) - 7)
+                + max(0, abs(high.pitch - previous_high.pitch) - 7)
+            ) * 2
+            spacing_penalty = max(0, 3 - spacing) * 4
+            common_tone_bonus = (
+                (3 if low.pitch in {previous_low.pitch, previous_high.pitch} else 0)
+                + (3 if high.pitch in {previous_low.pitch, previous_high.pitch} else 0)
+            )
+            strength_bonus = (low.velocity + high.velocity) / 127.0
+            score = movement + leap_penalty + spacing_penalty - common_tone_bonus - strength_bonus
+            candidates.append((score, low.pitch, high.pitch, low, high))
+
+    _, _, _, low, high = min(candidates, key=lambda candidate: candidate[:3])
+    return low, high
+
+
+def arpeggiate_inner_voices(inner, tempo: float, scale=None):
     """Roll sustained inner chords into a low-to-high arpeggio pattern."""
     import pretty_midi
 
+    if not inner:
+        return []
+
+    # Weak inner notes are texture mud on a Game Boy channel: drop them.
+    median_velocity = statistics.median(note.velocity for note in inner)
+    inner = [
+        note
+        for note in inner
+        if note.velocity >= median_velocity * INNER_VELOCITY_RATIO
+    ]
     if not inner:
         return []
     inner = sorted(inner, key=lambda note: (note.start, note.pitch))
@@ -587,14 +893,19 @@ def arpeggiate_inner_voices(inner, tempo: float):
         else:
             segments.append({"notes": [note], "end": note.end})
 
-    # Sixteenth-note arp rate, clamped so chords always cycle audibly.
-    step = min(0.25, max(0.1, (60.0 / tempo) / 4.0))
+    # A quarter-note pulse keeps the harmony recognizable without hammering
+    # continuously underneath the melody.
+    step = min(0.5, max(0.24, 60.0 / tempo))
     result = []
     for segment in segments:
         segment_notes = segment["notes"]
         start = min(note.start for note in segment_notes)
         end = segment["end"]
         pitches = sorted({note.pitch for note in segment_notes})
+        if scale and len(pitches) > 2:
+            in_scale = [pitch for pitch in pitches if pitch % 12 in scale]
+            if len(in_scale) >= 2:
+                pitches = in_scale
         if len(pitches) > ARPEGGIO_MAX_PITCHES:
             stride = max(1, len(pitches) // ARPEGGIO_MAX_PITCHES)
             pitches = pitches[::stride][:ARPEGGIO_MAX_PITCHES]
@@ -604,12 +915,15 @@ def arpeggiate_inner_voices(inner, tempo: float):
             result.extend(segment_notes)
             continue
 
-        velocity = int(statistics.mean(note.velocity for note in segment_notes) * 0.9)
+        velocity = int(
+            statistics.mean(note.velocity for note in segment_notes)
+            * ARPEGGIO_VELOCITY_SCALE
+        )
         velocity = max(1, min(127, velocity))
         position = start
         index = 0
         while position < end - 1e-6:
-            note_end = min(position + step, end)
+            note_end = min(position + step * ARPEGGIO_GATE_RATIO, end)
             if note_end - position >= MIN_NOTE_DURATION_SECONDS:
                 result.append(
                     pretty_midi.Note(
@@ -631,36 +945,64 @@ def main() -> int:
     source_group.add_argument("--input", type=Path)
     source_group.add_argument("--url")
     parser.add_argument("--mode", choices=("general", "piano"), default="piano")
-    parser.add_argument("--arrange", choices=("composer", "off"), default="composer")
+    parser.add_argument("--arrange", choices=("composer", "expanded", "off"), default="off")
+    parser.add_argument("--bpm", type=float)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--metadata-output", type=Path)
     args = parser.parse_args()
+    if args.bpm is not None and not 40 <= args.bpm <= 240:
+        parser.error("--bpm must be between 40 and 240")
 
     try:
+        report_progress(2, "Starting up")
         ffmpeg_path = find_ffmpeg()
         with tempfile.TemporaryDirectory(prefix="motif-audio-") as temp:
             work_dir = Path(temp)
             if args.url:
+                report_progress(5, "Downloading audio from YouTube")
                 source, title = download_audio(args.url, work_dir, ffmpeg_path)
+                report_progress(20, "Audio downloaded")
             else:
                 source = args.input.resolve()
                 if not source.is_file():
                     raise FileNotFoundError(f"Audio file not found: {source}")
                 title = source.stem
 
+            report_progress(25, "Converting audio")
             normalized = work_dir / "normalized.wav"
             convert_to_wav(source, normalized, ffmpeg_path)
-            transcribe(normalized, args.output.resolve(), args.mode)
-            arranged = (
-                args.arrange == "composer"
-                and apply_composer_arrangement(args.output.resolve())
-            )
+            tempo = args.bpm
+            bpm_source = "manual" if tempo is not None else None
+            if tempo is None:
+                report_progress(30, "Detecting the song speed")
+                tempo = detect_audio_tempo(normalized)
+                if tempo is not None:
+                    bpm_source = "detected"
+            transcribe(normalized, args.output.resolve(), args.mode, tempo)
+            arranged = False
+            if args.arrange in {"composer", "expanded"}:
+                label = (
+                    "Applying expanded four-voice arrangement"
+                    if args.arrange == "expanded"
+                    else "Applying classic three-voice arrangement"
+                )
+                report_progress(94, label)
+                arranged = apply_composer_arrangement(
+                    args.output.resolve(),
+                    expanded=args.arrange == "expanded",
+                    tempo_override=tempo,
+                )
+            else:
+                report_progress(94, "Preserving the transcription")
+            report_progress(99, "Finishing")
             if args.metadata_output:
                 args.metadata_output.resolve().write_text(
                     json.dumps(
                         {
                             "title": title,
-                            "arrangement": "composer" if arranged else "original",
+                            "arrangement": args.arrange if arranged else "original",
+                            "bpm": tempo,
+                            "bpm_source": bpm_source,
                         },
                         ensure_ascii=True,
                     ),

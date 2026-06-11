@@ -1106,6 +1106,34 @@
             font-size: 7px;
             color: var(--gb-dark);
         }
+        .arrangement-setting {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 10px;
+            color: var(--gb-darkest);
+        }
+        .arrangement-setting label {
+            font-size: 8px;
+        }
+        .arrangement-setting select {
+            flex: 1;
+            min-width: 240px;
+            background: var(--gb-lightest);
+            color: var(--gb-darkest);
+            border: 2px solid var(--gb-dark);
+            padding: 8px 10px;
+            font-family: 'Press Start 2P', monospace;
+            font-size: 8px;
+        }
+        .arrangement-help {
+            width: 100%;
+            margin: 0;
+            color: var(--gb-dark);
+            font-size: 8px;
+            line-height: 1.7;
+        }
 
         .audio-import {
             margin-top: calc(var(--spacing-unit) * 2);
@@ -1127,6 +1155,10 @@
             flex: 1;
             min-width: 240px;
         }
+        .audio-import-row input[type="number"] {
+            width: 150px;
+            min-width: 130px;
+        }
         .audio-import-row select {
             background: var(--gb-lightest);
             color: var(--gb-darkest);
@@ -1140,6 +1172,36 @@
             color: var(--gb-dark);
             font-size: 8px;
             line-height: 1.7;
+        }
+        .transcription-progress {
+            margin-top: 12px;
+            padding: 10px;
+            border: 2px solid var(--gb-dark);
+            background: var(--gb-light);
+        }
+        .transcription-progress[hidden] {
+            display: none;
+        }
+        .transcription-progress-copy {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 8px;
+            color: var(--gb-darkest);
+            font-size: 8px;
+            line-height: 1.5;
+        }
+        .transcription-progress-track {
+            height: 12px;
+            padding: 2px;
+            border: 2px solid var(--gb-darkest);
+            background: var(--gb-lightest);
+        }
+        .transcription-progress-fill {
+            width: 0;
+            height: 100%;
+            background: var(--gb-darkest);
+            transition: width 180ms linear;
         }
 
         /* Mobile: increase font sizes for readability */
@@ -1210,6 +1272,16 @@
                     <option value="piano" selected>Piano (best quality)</option>
                     <option value="general">General audio</option>
                 </select>
+                <input
+                    id="transcriptionBpm"
+                    type="number"
+                    min="40"
+                    max="240"
+                    step="0.1"
+                    inputmode="decimal"
+                    placeholder="BPM (optional)"
+                    aria-label="Known song speed in beats per minute"
+                />
                 <input type="text" id="audioUrlInput" placeholder="YouTube URL (content you may download)" />
                 <button id="transcribeUrlBtn" type="button">Make MIDI</button>
                 <button id="chooseAudioBtn" type="button">Upload audio</button>
@@ -1227,7 +1299,36 @@
                     <span>(optional: cleaner, max 3 notes)</span>
                 </label>
             </div>
-            <p class="audio-import-note">Use Piano for solo piano recordings. Use General for other instruments or mixed audio.</p>
+            <div class="arrangement-setting">
+                <label for="transcriptionArrangement">How should it simplify the song?</label>
+                <select id="transcriptionArrangement">
+                    <option value="off" selected>Closest to the original song</option>
+                    <option value="expanded">Fuller Game Boy remix</option>
+                    <option value="composer">Simple retro remix</option>
+                </select>
+                <p id="arrangementHelp" class="arrangement-help">
+                    Keeps every note the computer can hear. Start here for the most accurate result.
+                </p>
+            </div>
+            <p class="audio-import-note">BPM is optional. Enter a known song speed to tighten timing, or leave it blank for automatic timing. Not sure? Choose "Closest to the original song."</p>
+            <div
+                id="transcriptionProgress"
+                class="transcription-progress"
+                role="progressbar"
+                aria-label="Audio transcription progress"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow="0"
+                hidden
+            >
+                <div class="transcription-progress-copy">
+                    <span id="transcriptionProgressLabel">Starting transcription</span>
+                    <span id="transcriptionProgressPercent">0%</span>
+                </div>
+                <div class="transcription-progress-track">
+                    <div id="transcriptionProgressFill" class="transcription-progress-fill"></div>
+                </div>
+            </div>
         </div>
 
         <div id="status">Ready. Search any song to make a Game Boy version.</div>

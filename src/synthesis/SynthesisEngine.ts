@@ -2,6 +2,7 @@ import type { RoleAssignment, MotifConfig, SynthLayer, Role, NoteEvent } from '.
 
 interface SynthesisOptions {
   compressionEnabled?: boolean;
+  cleanArrangement?: boolean;
 }
 
 export class SynthesisEngine {
@@ -15,10 +16,12 @@ export class SynthesisEngine {
   private schedulerIntervalId: number | null = null;
   private startTime = 0;
   private nextEventIndex = new Map<Role, number>();
+  private cleanArrangement: boolean;
 
   constructor(audioContext: AudioContext, config: MotifConfig, options: SynthesisOptions = {}) {
     this.audioContext = audioContext;
     this.config = config;
+    this.cleanArrangement = options.cleanArrangement === true;
     this.masterGain = audioContext.createGain();
     this.compressor = audioContext.createDynamicsCompressor();
     const compressionEnabled = options.compressionEnabled === true;
@@ -214,12 +217,12 @@ export class SynthesisEngine {
 
   private getLayerGainForRole(role: Role): number {
     switch (role) {
-      case 'bass': return 0.4;
+      case 'bass': return this.cleanArrangement ? 0.27 : 0.4;
       case 'drone': return 0.2;
-      case 'ostinato': return 0.3;
-      case 'texture': return 0.065;
+      case 'ostinato': return this.cleanArrangement ? 0.055 : 0.18;
+      case 'texture': return this.cleanArrangement ? 0.032 : 0.045;
       case 'accents': return 0.5;
-      case 'melody': return 0.35;
+      case 'melody': return this.cleanArrangement ? 0.3 : 0.35;
       default: return 0.3;
     }
   }
@@ -254,7 +257,7 @@ export class SynthesisEngine {
         break;
       case 'melody':
         filter.type = 'lowpass';
-        filter.frequency.value = 4000;
+        filter.frequency.value = 2600;
         break;
     }
   }
@@ -277,7 +280,7 @@ export class SynthesisEngine {
     // Choose oscillator type based on role
     switch (role) {
       case 'bass':
-        osc.type = 'square';
+        osc.type = this.cleanArrangement ? 'triangle' : 'square';
         break;
       case 'drone':
         osc.type = 'sawtooth';
@@ -298,9 +301,12 @@ export class SynthesisEngine {
     envelope.connect(layer.filterNode);
     
     // Envelope based on velocity and duration with minimum times to prevent clicks
-    const gainValue = velocity * 0.5; // Scale velocity
-    const attackTime = Math.max(0.003, Math.min(0.025, duration * 0.06));
-    const maxRelease = role === 'texture' ? 0.07 : 0.11;
+    const highNoteScale = pitch > 79 ? 0.65 : 1;
+    const cleanScale = this.cleanArrangement ? 0.82 : 1;
+    const gainValue = velocity * 0.5 * highNoteScale * cleanScale;
+    const minimumAttack = this.cleanArrangement ? 0.012 : 0.003;
+    const attackTime = Math.max(minimumAttack, Math.min(0.03, duration * 0.08));
+    const maxRelease = this.cleanArrangement ? 0.055 : role === 'texture' ? 0.07 : 0.11;
     const releaseTime = Math.max(0.03, Math.min(maxRelease, duration * 0.2));
 
     envelope.gain.setValueAtTime(0, when);

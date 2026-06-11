@@ -35,6 +35,14 @@ export interface AudioTranscriptionResult {
   midi: ArrayBuffer;
   title?: string;
   arrangement?: string;
+  bpm?: number;
+  bpmSource?: string;
+}
+
+export interface AudioTranscriptionProgress {
+  status: 'running' | 'done';
+  percent: number;
+  label: string;
 }
 
 export class MIDIService {
@@ -128,42 +136,108 @@ export class MIDIService {
     }
   }
 
-  async transcribeYouTube(url: string, mode: 'piano' | 'general'): Promise<AudioTranscriptionResult> {
+  async transcribeYouTube(
+    url: string,
+    mode: 'piano' | 'general',
+    arrangement: 'off' | 'composer' | 'expanded',
+    bpm: number | undefined,
+    onProgress?: (progress: AudioTranscriptionProgress) => void
+  ): Promise<AudioTranscriptionResult> {
     const response = await this.fetchWithRetry(
       `${this.baseUrl}/api/audio/transcribe-url`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, mode }),
+        body: JSON.stringify({ url, mode, arrangement, bpm }),
       },
-      16 * 60 * 1000
+      30000
     );
-    return this.readTranscription(response);
+    return this.waitForTranscription(response, onProgress);
   }
 
-  async transcribeAudioFile(file: File, mode: 'piano' | 'general'): Promise<AudioTranscriptionResult> {
+  async transcribeAudioFile(
+    file: File,
+    mode: 'piano' | 'general',
+    arrangement: 'off' | 'composer' | 'expanded',
+    bpm: number | undefined,
+    onProgress?: (progress: AudioTranscriptionProgress) => void
+  ): Promise<AudioTranscriptionResult> {
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/api/audio/transcribe-upload?filename=${encodeURIComponent(file.name)}&mode=${mode}`,
+      `${this.baseUrl}/api/audio/transcribe-upload?filename=${encodeURIComponent(file.name)}&mode=${mode}&arrangement=${arrangement}${bpm === undefined ? '' : `&bpm=${encodeURIComponent(String(bpm))}`}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: file,
       },
-      16 * 60 * 1000
+      5 * 60 * 1000
     );
-    return this.readTranscription(response);
+    return this.waitForTranscription(response, onProgress);
+  }
+
+  private async waitForTranscription(
+    startResponse: Response,
+    onProgress?: (progress: AudioTranscriptionProgress) => void
+  ): Promise<AudioTranscriptionResult> {
+    if (!startResponse.ok) {
+      throw new Error(await this.readErrorMessage(startResponse, `Transcription failed: ${startResponse.status}`));
+    }
+
+    const started = await startResponse.json() as { jobId?: unknown };
+    if (typeof started.jobId !== 'string' || !started.jobId) {
+      throw new Error('The transcription server did not return a job ID.');
+    }
+
+    const deadline = Date.now() + 16 * 60 * 1000;
+    while (Date.now() < deadline) {
+      const progressResponse = await this.fetchWithRetry(
+        `${this.baseUrl}/api/audio/transcription/${encodeURIComponent(started.jobId)}`,
+        undefined,
+        20000
+      );
+      if (!progressResponse.ok) {
+        throw new Error(await this.readErrorMessage(
+          progressResponse,
+          `Could not check transcription progress: ${progressResponse.status}`
+        ));
+      }
+
+      const progress = await progressResponse.json() as {
+        status?: unknown;
+        percent?: unknown;
+        label?: unknown;
+        error?: unknown;
+      };
+      const percent = typeof progress.percent === 'number'
+        ? Math.max(0, Math.min(100, Math.round(progress.percent)))
+        : 0;
+      const label = typeof progress.label === 'string' ? progress.label : 'Working';
+
+      if (progress.status === 'error') {
+        throw new Error(typeof progress.error === 'string' ? progress.error : 'Transcription failed.');
+      }
+      if (progress.status !== 'running' && progress.status !== 'done') {
+        throw new Error('The transcription server returned an unknown job status.');
+      }
+
+      onProgress?.({ status: progress.status, percent, label });
+      if (progress.status === 'done') {
+        const resultResponse = await this.fetchWithRetry(
+          `${this.baseUrl}/api/audio/transcription/${encodeURIComponent(started.jobId)}/result`,
+          undefined,
+          60000
+        );
+        return this.readTranscription(resultResponse);
+      }
+
+      await new Promise<void>(resolve => window.setTimeout(resolve, 600));
+    }
+
+    throw new Error('Transcription timed out after 16 minutes.');
   }
 
   private async readTranscription(response: Response): Promise<AudioTranscriptionResult> {
     if (!response.ok) {
-      let message = `Transcription failed: ${response.status}`;
-      try {
-        const body = await response.json() as { error?: string };
-        if (body.error) message = body.error;
-      } catch {
-        // Keep the HTTP status fallback.
-      }
-      throw new Error(message);
+      throw new Error(await this.readErrorMessage(response, `Transcription failed: ${response.status}`));
     }
     const encodedTitle = response.headers.get('X-Motif-Title');
     let title: string | undefined;
@@ -175,7 +249,20 @@ export class MIDIService {
       }
     }
     const arrangement = response.headers.get('X-Motif-Arrangement') || undefined;
-    return { midi: await response.arrayBuffer(), title, arrangement };
+    const bpmHeader = response.headers.get('X-Motif-Bpm');
+    const parsedBpm = bpmHeader === null ? Number.NaN : Number(bpmHeader);
+    const bpm = Number.isFinite(parsedBpm) ? parsedBpm : undefined;
+    const bpmSource = response.headers.get('X-Motif-Bpm-Source') || undefined;
+    return { midi: await response.arrayBuffer(), title, arrangement, bpm, bpmSource };
+  }
+
+  private async readErrorMessage(response: Response, fallback: string): Promise<string> {
+    try {
+      const body = await response.json() as { error?: unknown };
+      return typeof body.error === 'string' && body.error ? body.error : fallback;
+    } catch {
+      return fallback;
+    }
   }
 
   async checkHealth(): Promise<boolean> {

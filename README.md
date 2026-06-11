@@ -19,11 +19,20 @@ and plays it through a homebrew Game Boy sound chip running in your browser.
   link. Two neural models to choose from: a dedicated piano model with note
   offset, velocity, and sustain-pedal detection, or Basic Pitch for
   everything else.
+- **Source separation** — optionally split the mix into vocals / drums /
+  bass / other with Demucs before transcribing, so each part is heard
+  cleanly. Drums land on the noise channel as real kick and hat hits.
 - **MIDI cleanup intelligence** — key inference, correction of likely
-  transcription errors, tempo estimation, and gentle quantization, so the
-  synth gets music instead of noise.
+  transcription errors, tempo + section detection, and gentle quantization,
+  so the synth gets music instead of noise.
 - **Composer Mode** — dense transcriptions are rewritten for Game Boy
   hardware instead of converted note-for-note (see below).
+- **Chip-authentic sound** — 12.5%/25% duty pulse leads with delayed
+  vibrato, slapback echo, triangle wave-channel bass, and white-noise
+  percussion. The Game Boy timbre without the hardware limits: full
+  polyphony, every voice plays.
+- **Player extras** — per-voice mute/volume mixer, loop-a-section mode,
+  live progress bar, transcription caching, and MIDI/WAV downloads.
 - **One-click Windows launcher** — `Start Wario Synth.bat` installs
   everything (Node deps, Python venv, the transcription models) and opens
   the app.

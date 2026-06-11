@@ -50,13 +50,34 @@ export class MotifEngine {
       cleanArrangement: composerArrangement,
     });
 
+    this.synthesisEngine.setupLayers(this.buildAssignments(events, transformMode, options));
+    console.log(`Motif: ${transformMode} mode ready`);
+  }
+
+  /** Build role assignments — shared by live playback and offline render. */
+  private buildAssignments(
+    events: NoteEvent[],
+    transformMode: 'passthrough' | 'procedural',
+    options: GenerationOptions = {}
+  ): RoleAssignment[] {
+    const lightweightMode = options.lightweightMode === true;
+    const arrangementMode = options.arrangementMode;
+    const composerArrangement = arrangementMode === 'composer' || arrangementMode === 'expanded';
+
+    // Drum events (MIDI channel 9) always go to the noise channel, whatever
+    // the arrangement does with the pitched material.
+    const drumEvents = events.filter(event => event.channel === 9);
+    const pitchedEvents = drumEvents.length > 0
+      ? events.filter(event => event.channel !== 9)
+      : events;
+
+    let assignments: RoleAssignment[];
     if (transformMode === 'passthrough') {
       // Direct playback mode - play MIDI as-is without transformations
-      // Create a single "melody" role assignment with all original events
-      const passthroughAssignment = [{
+      assignments = [{
         role: 'melody' as const,
         sourceTrack: 0,
-        events: events,
+        events: pitchedEvents.map(event => ({ ...event })),
         chords: [], // No chord processing
         confidence: 1.0,
         features: {
@@ -71,20 +92,56 @@ export class MotifEngine {
           register: 'mid' as const
         }
       }];
-
-      this.synthesisEngine.setupLayers(passthroughAssignment);
-      console.log('Motif: Passthrough mode - playing original MIDI patterns');
     } else {
       // Procedural mode - transform the MIDI with role mapping
-      const clonedEvents = events.map(event => ({ ...event }));
-      const roleAssignments = composerArrangement
+      const clonedEvents = pitchedEvents.map(event => ({ ...event }));
+      assignments = composerArrangement
         ? this.arrangeComposerTracks(clonedEvents, lightweightMode, arrangementMode)
         : this.looksLikeSoloPiano(clonedEvents)
           ? this.arrangeSoloPiano(clonedEvents, lightweightMode)
           : this.roleMapper.assignRoles(this.midiProcessor.extractFeatures(clonedEvents), clonedEvents);
-      this.synthesisEngine.setupLayers(roleAssignments);
-      console.log('Motif: Procedural mode - transforming MIDI with role mapping');
     }
+
+    if (drumEvents.length > 0) {
+      assignments.push(this.makePercussionAssignment(drumEvents.map(event => ({ ...event }))));
+    }
+    return assignments;
+  }
+
+  getActiveVoices(): Role[] {
+    return this.synthesisEngine ? this.synthesisEngine.getActiveVoices() : [];
+  }
+
+  setVoiceLevel(role: Role, level: number): void {
+    this.synthesisEngine?.setVoiceLevel(role, level);
+  }
+
+  setVoiceMuted(role: Role, muted: boolean): void {
+    this.synthesisEngine?.setVoiceMuted(role, muted);
+  }
+
+  isVoiceMuted(role: Role): boolean {
+    return this.synthesisEngine?.isVoiceMuted(role) ?? false;
+  }
+
+  getVoiceLevel(role: Role): number {
+    return this.synthesisEngine?.getVoiceLevel(role) ?? 1;
+  }
+
+  setLoopRegion(region: { start: number; end: number } | null): void {
+    this.synthesisEngine?.setLoopRegion(region);
+  }
+
+  private makePercussionAssignment(events: NoteEvent[]): RoleAssignment {
+    events.sort((a, b) => a.time - b.time || a.pitch - b.pitch);
+    return {
+      role: 'percussion',
+      sourceTrack: events[0].track,
+      events,
+      chords: [],
+      confidence: 1,
+      features: this.describeVoice(events),
+    };
   }
 
   private arrangeComposerTracks(
@@ -97,10 +154,11 @@ export class MotifEngine {
       ? ['melody', 'bass', 'texture', 'ostinato']
       : ['melody', 'bass', 'texture'];
     const assignments: RoleAssignment[] = [];
-    const trackLimit = lightweightMode ? 3 : roles.length;
+    // Full quality: every track plays. Only Lightweight Mode trims voices.
+    const trackLimit = lightweightMode ? 3 : trackIds.length;
 
     for (let index = 0; index < Math.min(trackIds.length, trackLimit); index++) {
-      const role = roles[index];
+      const role = roles[Math.min(index, roles.length - 1)];
       const voiceEvents = events
         .filter(event => event.track === trackIds[index])
         .sort((a, b) => a.time - b.time || a.pitch - b.pitch);
@@ -178,10 +236,12 @@ export class MotifEngine {
       if (ordered.length > 2) {
         const innerVoices = ordered.slice(1, -1);
         const center = innerVoices.reduce((sum, note) => sum + note.pitch, 0) / innerVoices.length;
+        // Full quality: keep all inner voices unless Lightweight Mode asks
+        // for the stripped-down version.
         voices.get('texture')!.push(
           ...innerVoices
             .sort((a, b) => Math.abs(a.pitch - center) - Math.abs(b.pitch - center))
-            .slice(0, lightweightMode ? 1 : 2)
+            .slice(0, lightweightMode ? 1 : innerVoices.length)
         );
       }
     }
@@ -371,38 +431,12 @@ export class MotifEngine {
   async renderOffline(
     events: NoteEvent[],
     transformMode: 'passthrough' | 'procedural' = 'passthrough',
-    sampleRate = 44100
+    sampleRate = 44100,
+    options: GenerationOptions = {}
   ): Promise<AudioBuffer> {
-    let roleAssignments;
-
-    if (transformMode === 'passthrough') {
-      // Direct playback mode - play MIDI as-is without transformations
-      roleAssignments = [{
-        role: 'melody' as const,
-        sourceTrack: 0,
-        events: [...events], // Clone to avoid mutation
-        chords: [],
-        confidence: 1.0,
-        features: {
-          medianPitch: 60,
-          pitchRange: 48,
-          noteDensity: 1.0,
-          polyphonyRatio: 0.5,
-          averageDuration: 0.5,
-          repetitionScore: 0.5,
-          isMonophonic: false,
-          hasPhraseContinuity: true,
-          register: 'mid' as const
-        }
-      }];
-    } else {
-      // Procedural mode - transform the MIDI with role mapping
-      // Clone events to avoid mutating originals
-      const clonedEvents = events.map(e => ({ ...e }));
-      const features = this.midiProcessor.extractFeatures(clonedEvents);
-      roleAssignments = this.roleMapper.assignRoles(features, clonedEvents);
-    }
-
+    // Same assignment pipeline as live playback, so the render matches
+    // what the user hears (arrangement modes, drums, voice roles).
+    const roleAssignments = this.buildAssignments(events, transformMode, options);
     console.log(`Motif: Offline rendering in ${transformMode} mode`);
     return SynthesisEngine.renderOffline(roleAssignments, this.config, sampleRate);
   }

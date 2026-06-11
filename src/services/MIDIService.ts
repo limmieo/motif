@@ -37,6 +37,7 @@ export interface AudioTranscriptionResult {
   arrangement?: string;
   bpm?: number;
   bpmSource?: string;
+  sections?: number[];
 }
 
 export interface AudioTranscriptionProgress {
@@ -141,6 +142,7 @@ export class MIDIService {
     mode: 'piano' | 'general',
     arrangement: 'off' | 'composer' | 'expanded',
     bpm: number | undefined,
+    separate: boolean,
     onProgress?: (progress: AudioTranscriptionProgress) => void
   ): Promise<AudioTranscriptionResult> {
     const response = await this.fetchWithRetry(
@@ -148,7 +150,7 @@ export class MIDIService {
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, mode, arrangement, bpm }),
+        body: JSON.stringify({ url, mode, arrangement, bpm, separate }),
       },
       30000
     );
@@ -160,10 +162,14 @@ export class MIDIService {
     mode: 'piano' | 'general',
     arrangement: 'off' | 'composer' | 'expanded',
     bpm: number | undefined,
+    separate: boolean,
     onProgress?: (progress: AudioTranscriptionProgress) => void
   ): Promise<AudioTranscriptionResult> {
+    const query = `filename=${encodeURIComponent(file.name)}&mode=${mode}&arrangement=${arrangement}`
+      + `${separate ? '&separate=true' : ''}`
+      + `${bpm === undefined ? '' : `&bpm=${encodeURIComponent(String(bpm))}`}`;
     const response = await this.fetchWithRetry(
-      `${this.baseUrl}/api/audio/transcribe-upload?filename=${encodeURIComponent(file.name)}&mode=${mode}&arrangement=${arrangement}${bpm === undefined ? '' : `&bpm=${encodeURIComponent(String(bpm))}`}`,
+      `${this.baseUrl}/api/audio/transcribe-upload?${query}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
@@ -187,7 +193,7 @@ export class MIDIService {
       throw new Error('The transcription server did not return a job ID.');
     }
 
-    const deadline = Date.now() + 16 * 60 * 1000;
+    const deadline = Date.now() + 31 * 60 * 1000;
     while (Date.now() < deadline) {
       const progressResponse = await this.fetchWithRetry(
         `${this.baseUrl}/api/audio/transcription/${encodeURIComponent(started.jobId)}`,
@@ -232,7 +238,7 @@ export class MIDIService {
       await new Promise<void>(resolve => window.setTimeout(resolve, 600));
     }
 
-    throw new Error('Transcription timed out after 16 minutes.');
+    throw new Error('Transcription timed out after 31 minutes.');
   }
 
   private async readTranscription(response: Response): Promise<AudioTranscriptionResult> {
@@ -253,7 +259,19 @@ export class MIDIService {
     const parsedBpm = bpmHeader === null ? Number.NaN : Number(bpmHeader);
     const bpm = Number.isFinite(parsedBpm) ? parsedBpm : undefined;
     const bpmSource = response.headers.get('X-Motif-Bpm-Source') || undefined;
-    return { midi: await response.arrayBuffer(), title, arrangement, bpm, bpmSource };
+    let sections: number[] | undefined;
+    try {
+      const sectionsHeader = response.headers.get('X-Motif-Sections');
+      if (sectionsHeader) {
+        const parsed = JSON.parse(sectionsHeader) as unknown;
+        if (Array.isArray(parsed)) {
+          sections = parsed.filter((value): value is number => typeof value === 'number');
+        }
+      }
+    } catch {
+      // Sections are a bonus; ignore malformed headers.
+    }
+    return { midi: await response.arrayBuffer(), title, arrangement, bpm, bpmSource, sections };
   }
 
   private async readErrorMessage(response: Response, fallback: string): Promise<string> {

@@ -4,4 +4,7 @@ basic-pitch
 librosa>=0.10,<0.12
 yt-dlp[default]>=2026.6.9
 torch
+torchaudio
 piano-transcription-inference
+# Source separation (vocals / drums / bass / other) before transcription.
+demucs

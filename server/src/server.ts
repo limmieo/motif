@@ -22,6 +22,7 @@ app.use(cors({
     'X-Motif-Arrangement',
     'X-Motif-Bpm',
     'X-Motif-Bpm-Source',
+    'X-Motif-Sections',
   ],
 }));
 app.use(express.json());
@@ -40,6 +41,7 @@ type AudioTranscriptionResult = {
   arrangement?: string;
   bpm?: number;
   bpmSource?: string;
+  sections?: number[];
 };
 
 type TranscriptionJob = {
@@ -56,7 +58,54 @@ type TranscriptionJob = {
 
 const transcriptionJobs = new Map<string, TranscriptionJob>();
 const TRANSCRIPTION_JOB_TTL_MS = 10 * 60 * 1000;
-const TRANSCRIPTION_TIMEOUT_MS = 15 * 60 * 1000;
+// Source separation runs a second neural model on CPU; give it headroom.
+const TRANSCRIPTION_TIMEOUT_MS = 30 * 60 * 1000;
+
+// Completed transcriptions are cached on disk: repeat requests for the same
+// source + settings come back instantly instead of recomputing for minutes.
+const transcriptionCacheDir = path.resolve(serverDir, '../cache/transcriptions');
+
+function transcriptionCacheKey(parts: Record<string, unknown>): string {
+  return crypto.createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+}
+
+async function readCachedTranscription(key: string): Promise<AudioTranscriptionResult | null> {
+  try {
+    const midi = await fs.readFile(path.join(transcriptionCacheDir, `${key}.mid`));
+    const meta = JSON.parse(
+      await fs.readFile(path.join(transcriptionCacheDir, `${key}.json`), 'utf8')
+    ) as Omit<AudioTranscriptionResult, 'midi'>;
+    return { ...meta, midi };
+  } catch {
+    return null;
+  }
+}
+
+async function writeCachedTranscription(key: string, result: AudioTranscriptionResult): Promise<void> {
+  try {
+    await fs.mkdir(transcriptionCacheDir, { recursive: true });
+    const { midi, ...meta } = result;
+    await fs.writeFile(path.join(transcriptionCacheDir, `${key}.mid`), midi);
+    await fs.writeFile(path.join(transcriptionCacheDir, `${key}.json`), JSON.stringify(meta));
+  } catch (error) {
+    console.warn('Could not write transcription cache:', error);
+  }
+}
+
+function makeCachedJob(result: AudioTranscriptionResult): TranscriptionJob {
+  const job: TranscriptionJob = {
+    id: crypto.randomUUID(),
+    status: 'done',
+    percent: 100,
+    label: 'Done (from cache)',
+    result,
+    workDir: '',
+    createdAt: Date.now(),
+  };
+  transcriptionJobs.set(job.id, job);
+  setTimeout(() => transcriptionJobs.delete(job.id), TRANSCRIPTION_JOB_TTL_MS).unref();
+  return job;
+}
 
 function friendlyTranscriptionError(detail: string): string {
   const missingDependency = /No module named|not recognized|ENOENT|FFmpeg was not found/i.test(detail);
@@ -74,7 +123,12 @@ function parseBpm(value: unknown): number | undefined {
   return bpm;
 }
 
-function startTranscriptionJob(args: string[], workDir: string, titleOverride?: string): TranscriptionJob {
+function startTranscriptionJob(
+  args: string[],
+  workDir: string,
+  titleOverride?: string,
+  cacheKey?: string
+): TranscriptionJob {
   const id = crypto.randomUUID();
   const midiPath = path.join(workDir, 'transcription.mid');
   const metadataPath = path.join(workDir, 'metadata.json');
@@ -151,17 +205,24 @@ function startTranscriptionJob(args: string[], workDir: string, titleOverride?: 
         let arrangement: string | undefined;
         let bpm: number | undefined;
         let bpmSource: string | undefined;
+        let sections: number[] | undefined;
         try {
           const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')) as {
             title?: unknown;
             arrangement?: unknown;
             bpm?: unknown;
             bpm_source?: unknown;
+            sections?: unknown;
           };
           if (typeof metadata.title === 'string') title = metadata.title.slice(0, 300);
           if (typeof metadata.arrangement === 'string') arrangement = metadata.arrangement.slice(0, 50);
           if (typeof metadata.bpm === 'number' && Number.isFinite(metadata.bpm)) bpm = metadata.bpm;
           if (typeof metadata.bpm_source === 'string') bpmSource = metadata.bpm_source.slice(0, 20);
+          if (Array.isArray(metadata.sections)) {
+            sections = metadata.sections
+              .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+              .slice(0, 50);
+          }
         } catch {
           // Metadata is helpful but not required for playback.
         }
@@ -171,10 +232,12 @@ function startTranscriptionJob(args: string[], workDir: string, titleOverride?: 
           arrangement,
           bpm,
           bpmSource,
+          sections,
         };
         job.status = 'done';
         job.percent = 100;
         job.label = 'Done';
+        if (cacheKey) await writeCachedTranscription(cacheKey, job.result);
       } catch (readError) {
         job.status = 'error';
         job.error = 'Transcription finished but produced no MIDI file.';
@@ -369,13 +432,16 @@ app.post('/api/audio/transcribe-url', async (req, res) => {
       return res.status(400).json({ error: 'Only YouTube URLs are supported.' });
     }
 
+    const separate = req.body?.separate === true || req.body?.separate === 'true';
+    const cacheKey = transcriptionCacheKey({ kind: 'url', url, mode, arrangement, separate, bpm });
+    const cached = await readCachedTranscription(cacheKey);
+    if (cached) return res.json({ jobId: makeCachedJob(cached).id });
+
     const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'motif-transcribe-'));
     const args = ['--url', url, '--mode', mode, '--arrange', arrangement];
+    if (separate) args.push('--separate');
     if (bpm !== undefined) args.push('--bpm', String(bpm));
-    const job = startTranscriptionJob(
-      args,
-      workDir
-    );
+    const job = startTranscriptionJob(args, workDir, undefined, cacheKey);
     res.json({ jobId: job.id });
   } catch (error) {
     sendTranscriptionError(res, error);
@@ -406,6 +472,7 @@ app.get('/api/audio/transcription/:jobId/result', (req, res) => {
   if (job.result.arrangement) res.setHeader('X-Motif-Arrangement', job.result.arrangement);
   if (job.result.bpm !== undefined) res.setHeader('X-Motif-Bpm', String(job.result.bpm));
   if (job.result.bpmSource) res.setHeader('X-Motif-Bpm-Source', job.result.bpmSource);
+  if (job.result.sections?.length) res.setHeader('X-Motif-Sections', JSON.stringify(job.result.sections));
   res.send(job.result.midi);
 });
 
@@ -432,17 +499,20 @@ app.post(
       }
 
       // The upload lives in the job's work dir so job cleanup removes it.
+      const separate = req.query.separate === 'true';
+      const fileHash = crypto.createHash('sha256').update(req.body).digest('hex');
+      const cacheKey = transcriptionCacheKey({ kind: 'upload', fileHash, mode, arrangement, separate, bpm });
+      const cached = await readCachedTranscription(cacheKey);
+      if (cached) return res.json({ jobId: makeCachedJob(cached).id });
+
       const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'motif-upload-'));
       const inputPath = path.join(workDir, `upload${extension}`);
       await fs.writeFile(inputPath, req.body);
       const uploadTitle = path.parse(requestedName).name.slice(0, 300);
       const args = ['--input', inputPath, '--mode', mode, '--arrange', arrangement];
+      if (separate) args.push('--separate');
       if (bpm !== undefined) args.push('--bpm', String(bpm));
-      const job = startTranscriptionJob(
-        args,
-        workDir,
-        uploadTitle
-      );
+      const job = startTranscriptionJob(args, workDir, uploadTitle, cacheKey);
       res.json({ jobId: job.id });
     } catch (error) {
       sendTranscriptionError(res, error);

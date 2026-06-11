@@ -19,7 +19,13 @@ class MotifApp {
   private transcriptionMode!: HTMLSelectElement;
   private transcriptionArrangement!: HTMLSelectElement;
   private transcriptionBpm!: HTMLInputElement;
+  private separateStems!: HTMLInputElement;
   private arrangementHelp!: HTMLElement;
+  private voiceMixer!: HTMLElement;
+  private sectionLoopRow!: HTMLElement;
+  private sectionLoopSelect!: HTMLSelectElement;
+  private downloadMidiBtn!: HTMLButtonElement;
+  private downloadWavBtn!: HTMLButtonElement;
   private transcribeUrlBtn!: HTMLButtonElement;
   private audioFileInput!: HTMLInputElement;
   private chooseAudioBtn!: HTMLButtonElement;
@@ -86,7 +92,7 @@ class MotifApp {
 
   private searchResults: any[] = [];
   private selectedResultIndex = 0;
-  private currentMIDI: { events: NoteEvent[], metadata: any } | null = null;
+  private currentMIDI: { events: NoteEvent[], metadata: any, buffer?: ArrayBuffer } | null = null;
   private currentMIDIIsShareable = false;
 
   constructor() {
@@ -121,7 +127,13 @@ class MotifApp {
     this.transcriptionMode = document.getElementById('transcriptionMode') as HTMLSelectElement;
     this.transcriptionArrangement = document.getElementById('transcriptionArrangement') as HTMLSelectElement;
     this.transcriptionBpm = document.getElementById('transcriptionBpm') as HTMLInputElement;
+    this.separateStems = document.getElementById('separateStems') as HTMLInputElement;
     this.arrangementHelp = document.getElementById('arrangementHelp')!;
+    this.voiceMixer = document.getElementById('voiceMixer')!;
+    this.sectionLoopRow = document.getElementById('sectionLoopRow')!;
+    this.sectionLoopSelect = document.getElementById('sectionLoopSelect') as HTMLSelectElement;
+    this.downloadMidiBtn = document.getElementById('downloadMidiBtn') as HTMLButtonElement;
+    this.downloadWavBtn = document.getElementById('downloadWavBtn') as HTMLButtonElement;
     this.transcribeUrlBtn = document.getElementById('transcribeUrlBtn') as HTMLButtonElement;
     this.audioFileInput = document.getElementById('audioFileInput') as HTMLInputElement;
     this.chooseAudioBtn = document.getElementById('chooseAudioBtn') as HTMLButtonElement;
@@ -224,6 +236,11 @@ class MotifApp {
     this.copyLinkBtn.addEventListener('click', () => void this.handleCopyLink());
     this.shareToXBtn.addEventListener('click', () => void this.handleShareToX());
 
+    // Downloads + section looping (generated block)
+    this.downloadMidiBtn.addEventListener('click', () => this.handleDownloadMidi());
+    this.downloadWavBtn.addEventListener('click', () => void this.handleDownloadWav());
+    this.sectionLoopSelect.addEventListener('change', () => this.handleSectionLoopChange());
+
     // Embed snippet copy (may be disabled / not-live)
     this.copyEmbedBtn?.addEventListener('click', () => void this.copyEmbedSnippet());
 
@@ -258,6 +275,7 @@ class MotifApp {
         this.getTranscriptionMode(),
         this.getTranscriptionArrangement(),
         this.getTranscriptionBpm(),
+        this.separateStems.checked,
         onProgress
       ),
       'YouTube transcription'
@@ -271,6 +289,7 @@ class MotifApp {
         this.getTranscriptionMode(),
         this.getTranscriptionArrangement(),
         this.getTranscriptionBpm(),
+        this.separateStems.checked,
         onProgress
       ),
       file.name.replace(/\.[^.]+$/, '') || 'Audio transcription'
@@ -316,6 +335,7 @@ class MotifApp {
       arrangement?: string;
       bpm?: number;
       bpmSource?: string;
+      sections?: number[];
     }>,
     fallbackTitle: string
   ): Promise<void> {
@@ -346,16 +366,20 @@ class MotifApp {
           arrangement: transcription.arrangement,
           bpm: transcription.bpm,
           bpmSource: transcription.bpmSource,
+          sections: transcription.sections,
         },
+        buffer: midiBuffer,
       };
       this.currentMIDIIsShareable = false;
       this.hasGenerated = false;
       this.selectedTitle.textContent = this.cleanSongTitle(title);
-      const arrangementLabel = transcription.arrangement === 'expanded'
-        ? 'Audio converted with the Fuller Game Boy remix setting'
-        : transcription.arrangement === 'composer'
-          ? 'Audio converted with the Simple retro remix setting'
-          : 'Audio converted with the Closest to the original song setting';
+      const arrangementLabel = transcription.arrangement === 'stems'
+        ? 'Audio converted with separated instruments (melody / harmony / bass / drums)'
+        : transcription.arrangement === 'expanded'
+          ? 'Audio converted with the Fuller Game Boy remix setting'
+          : transcription.arrangement === 'composer'
+            ? 'Audio converted with the Simple retro remix setting'
+            : 'Audio converted with the Closest to the original song setting';
       const bpmLabel = transcription.bpm === undefined
         ? ''
         : ` | Timing: ${transcription.bpm} BPM (${
@@ -630,7 +654,7 @@ class MotifApp {
         actualDuration = Math.max(...events.map(e => e.time + e.duration));
       }
 
-      this.currentMIDI = { events, metadata: { ...metadata, duration: actualDuration } };
+      this.currentMIDI = { events, metadata: { ...metadata, duration: actualDuration }, buffer: midiBuffer };
       this.currentMIDIIsShareable = true;
 
       // Update UI
@@ -751,6 +775,8 @@ class MotifApp {
 
       this.updateStatus('');
       this.hasGenerated = true;
+      this.renderVoiceMixer();
+      this.setupSectionLoop();
       // Refresh generated state now that generation succeeded (enables Copy link, etc.)
       const scrollYEnd = window.scrollY;
       this.setState('generated');
@@ -770,6 +796,192 @@ class MotifApp {
     this.playPauseBtn.textContent = 'Play';
     this.stopMotifProgressUpdates();
     this.updateStatus('');
+  }
+
+  private static readonly VOICE_LABELS: Record<string, string> = {
+    melody: 'Melody (lead)',
+    bass: 'Bass',
+    texture: 'Harmony',
+    ostinato: 'Arpeggio',
+    drone: 'Drone',
+    accents: 'Accents',
+    percussion: 'Drums (noise)',
+  };
+
+  private renderVoiceMixer(): void {
+    const voices = this.motifEngine.getActiveVoices();
+    this.voiceMixer.innerHTML = '';
+    if (voices.length < 2) {
+      this.voiceMixer.style.display = 'none';
+      return;
+    }
+    for (const role of voices) {
+      const row = document.createElement('div');
+      row.className = 'mixer-row';
+
+      const name = document.createElement('span');
+      name.className = 'voice-name';
+      name.textContent = MotifApp.VOICE_LABELS[role] ?? role;
+
+      const slider = document.createElement('input');
+      slider.type = 'range';
+      slider.min = '0';
+      slider.max = '100';
+      slider.value = String(Math.round(this.motifEngine.getVoiceLevel(role) * 100));
+      slider.setAttribute('aria-label', `${name.textContent} volume`);
+      slider.addEventListener('input', () => {
+        this.motifEngine.setVoiceLevel(role, Number(slider.value) / 100);
+      });
+
+      const muteBtn = document.createElement('button');
+      muteBtn.type = 'button';
+      muteBtn.textContent = this.motifEngine.isVoiceMuted(role) ? 'Unmute' : 'Mute';
+      muteBtn.classList.toggle('muted', this.motifEngine.isVoiceMuted(role));
+      muteBtn.addEventListener('click', () => {
+        const muted = !this.motifEngine.isVoiceMuted(role);
+        this.motifEngine.setVoiceMuted(role, muted);
+        muteBtn.classList.toggle('muted', muted);
+        muteBtn.textContent = muted ? 'Unmute' : 'Mute';
+      });
+
+      row.append(name, slider, muteBtn);
+      this.voiceMixer.appendChild(row);
+    }
+    this.voiceMixer.style.display = 'flex';
+  }
+
+  private setupSectionLoop(): void {
+    const sections = (this.currentMIDI?.metadata?.sections as number[] | undefined) ?? [];
+    const duration = this.motifEngine.getDuration();
+    this.sectionLoopSelect.innerHTML = '';
+    this.motifEngine.setLoopRegion(null);
+    if (sections.length < 2 || duration <= 0) {
+      this.sectionLoopRow.style.display = 'none';
+      return;
+    }
+
+    const whole = document.createElement('option');
+    whole.value = '';
+    whole.textContent = 'Whole song';
+    this.sectionLoopSelect.appendChild(whole);
+
+    sections.forEach((start, index) => {
+      const end = index + 1 < sections.length ? sections[index + 1] : duration;
+      if (end - start < 2 || start >= duration) return;
+      const option = document.createElement('option');
+      option.value = `${start}|${Math.min(end, duration)}`;
+      option.textContent = `Section ${index + 1} (${this.formatTime(start)}-${this.formatTime(Math.min(end, duration))})`;
+      this.sectionLoopSelect.appendChild(option);
+    });
+
+    this.sectionLoopRow.style.display = this.sectionLoopSelect.options.length > 1 ? 'flex' : 'none';
+  }
+
+  private handleSectionLoopChange(): void {
+    const value = this.sectionLoopSelect.value;
+    if (!value) {
+      this.motifEngine.setLoopRegion(null);
+      return;
+    }
+    const [start, end] = value.split('|').map(Number);
+    if (Number.isFinite(start) && Number.isFinite(end)) {
+      this.motifEngine.setLoopRegion({ start, end });
+    }
+  }
+
+  private handleDownloadMidi(): void {
+    const buffer = this.currentMIDI?.buffer;
+    if (!buffer) {
+      this.updateStatus('No MIDI is loaded to download.');
+      return;
+    }
+    const name = `${this.sanitizeFileName(this.selectedTitle.textContent || 'wario-synth')}.mid`;
+    this.triggerDownload(new Blob([buffer], { type: 'audio/midi' }), name);
+  }
+
+  private async handleDownloadWav(): Promise<void> {
+    if (!this.currentMIDI) {
+      this.updateStatus('Load a song first.');
+      return;
+    }
+    this.downloadWavBtn.disabled = true;
+    this.updateStatus('Rendering WAV...');
+    try {
+      const arrangementMode = this.currentMIDI.metadata?.arrangement as
+        | 'original'
+        | 'composer'
+        | 'expanded'
+        | undefined;
+      const rendered = await this.motifEngine.renderOffline(
+        this.currentMIDI.events,
+        arrangementMode === 'original' && !this.lightweightMode.checked ? 'passthrough' : 'procedural',
+        44100,
+        { lightweightMode: this.lightweightMode.checked, arrangementMode }
+      );
+      const name = `${this.sanitizeFileName(this.selectedTitle.textContent || 'wario-synth')}.wav`;
+      this.triggerDownload(MotifApp.audioBufferToWavBlob(rendered), name);
+      this.updateStatus('');
+    } catch (error) {
+      this.updateStatus(`WAV render error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      this.downloadWavBtn.disabled = false;
+    }
+  }
+
+  private sanitizeFileName(name: string): string {
+    return (
+      name.replace(/[^a-z0-9\- _]/gi, '').trim().replace(/\s+/g, '-').toLowerCase()
+      || 'wario-synth'
+    );
+  }
+
+  private triggerDownload(blob: Blob, filename: string): void {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  }
+
+  private static audioBufferToWavBlob(buffer: AudioBuffer): Blob {
+    const channels = buffer.numberOfChannels;
+    const sampleRate = buffer.sampleRate;
+    const frames = buffer.length;
+    const bytesPerSample = 2;
+    const dataSize = frames * channels * bytesPerSample;
+    const arrayBuffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(arrayBuffer);
+    const writeString = (offset: number, text: string) => {
+      for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+    };
+
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); // PCM
+    view.setUint16(22, channels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * channels * bytesPerSample, true);
+    view.setUint16(32, channels * bytesPerSample, true);
+    view.setUint16(34, 16, true);
+    writeString(36, 'data');
+    view.setUint32(40, dataSize, true);
+
+    const channelData = Array.from({ length: channels }, (_, c) => buffer.getChannelData(c));
+    let offset = 44;
+    for (let i = 0; i < frames; i++) {
+      for (let c = 0; c < channels; c++) {
+        const sample = Math.max(-1, Math.min(1, channelData[c][i]));
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+        offset += bytesPerSample;
+      }
+    }
+    return new Blob([arrayBuffer], { type: 'audio/wav' });
   }
 
   private handleMotifSeek(progress: number): void {

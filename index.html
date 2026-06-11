@@ -883,6 +883,48 @@
             min-width: 55px;
         }
 
+        /* Per-voice mixer (generated block) */
+        .voice-mixer {
+            margin-top: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            text-align: left;
+        }
+        .voice-mixer .mixer-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .voice-mixer .mixer-row .voice-name {
+            font-size: 0.8em;
+            width: 110px;
+            flex-shrink: 0;
+            color: var(--gb-lightest);
+        }
+        .voice-mixer .mixer-row input[type="range"] {
+            flex: 1;
+            min-width: 80px;
+        }
+        .voice-mixer .mixer-row button {
+            font-size: 0.75em;
+            padding: 6px 10px;
+            flex-shrink: 0;
+        }
+        .voice-mixer .mixer-row button.muted {
+            opacity: 0.45;
+        }
+        .section-loop {
+            margin-top: 12px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            justify-content: flex-start;
+        }
+        .section-loop label {
+            font-size: 0.8em;
+        }
+
         /* iOS audio unlock (Motif) */
         .ios-audio-banner {
             margin-top: calc(var(--spacing-unit) * 2);
@@ -1299,6 +1341,13 @@
                     <span>(optional: cleaner, max 3 notes)</span>
                 </label>
             </div>
+            <div class="lightweight-setting">
+                <label>
+                    <input id="separateStems" type="checkbox" />
+                    Separate instruments first
+                    <span>(best for full songs with vocals/drums — slower, one-time model download)</span>
+                </label>
+            </div>
             <div class="arrangement-setting">
                 <label for="transcriptionArrangement">How should it simplify the song?</label>
                 <select id="transcriptionArrangement">
@@ -1399,7 +1448,16 @@
                         </div>
                     </div>
 
+                    <div id="voiceMixer" class="voice-mixer" style="display:none;"></div>
+
+                    <div id="sectionLoopRow" class="section-loop" style="display:none;">
+                        <label for="sectionLoopSelect">Loop</label>
+                        <select id="sectionLoopSelect"></select>
+                    </div>
+
                     <div style="margin-top: 14px; display: flex; gap: 12px; flex-wrap: wrap;">
+                        <button id="downloadMidiBtn" type="button">Download MIDI</button>
+                        <button id="downloadWavBtn" type="button">Download WAV</button>
                         <button id="copyLinkBtn" type="button" disabled>Copy link</button>
                         <button id="shareToXBtn" type="button" disabled>Share to X</button>
                     </div>

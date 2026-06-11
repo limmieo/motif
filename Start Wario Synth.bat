@@ -31,9 +31,9 @@ if not exist "server\.venv\Scripts\python.exe" (
     if errorlevel 1 goto :error
 )
 
-"server\.venv\Scripts\python.exe" -c "import torch, piano_transcription_inference" >nul 2>&1
+"server\.venv\Scripts\python.exe" -c "import torch, piano_transcription_inference, demucs" >nul 2>&1
 if errorlevel 1 (
-    echo Installing Piano Mode...
+    echo Installing audio models...
     "server\.venv\Scripts\python.exe" -m pip install -r "server\requirements-audio.txt"
     if errorlevel 1 goto :error
 )

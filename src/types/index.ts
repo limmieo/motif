@@ -36,7 +36,7 @@ export interface StructuralFeatures {
   trackFeatures: Map<number, TrackFeatures>;
 }
 
-export type Role = 'bass' | 'drone' | 'ostinato' | 'texture' | 'accents' | 'melody';
+export type Role = 'bass' | 'drone' | 'ostinato' | 'texture' | 'accents' | 'melody' | 'percussion';
 
 export interface RoleAssignment {
   role: Role;
@@ -52,6 +52,7 @@ export interface SynthLayer {
   oscillators: OscillatorNode[];
   gainNode: GainNode;
   filterNode: BiquadFilterNode;
+  extraNodes?: AudioNode[];
 }
 
 export interface MotifConfig {

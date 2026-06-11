@@ -17,6 +17,11 @@ export class SynthesisEngine {
   private startTime = 0;
   private nextEventIndex = new Map<Role, number>();
   private cleanArrangement: boolean;
+  private noiseBuffer: AudioBuffer | null = null;
+  private pulseWaves = new Map<number, PeriodicWave>();
+  private voiceLevels = new Map<Role, number>();
+  private mutedVoices = new Set<Role>();
+  private loopRegion: { start: number; end: number } | null = null;
 
   constructor(audioContext: AudioContext, config: MotifConfig, options: SynthesisOptions = {}) {
     this.audioContext = audioContext;
@@ -54,6 +59,71 @@ export class SynthesisEngine {
     }
   }
 
+  /** Voices currently set up, in a stable order for UI display. */
+  getActiveVoices(): Role[] {
+    return Array.from(this.layers.keys());
+  }
+
+  /** Set a per-voice volume multiplier (0..1). */
+  setVoiceLevel(role: Role, level: number): void {
+    this.voiceLevels.set(role, Math.max(0, Math.min(1, level)));
+    this.applyVoiceGain(role);
+  }
+
+  setVoiceMuted(role: Role, muted: boolean): void {
+    if (muted) this.mutedVoices.add(role);
+    else this.mutedVoices.delete(role);
+    this.applyVoiceGain(role);
+  }
+
+  isVoiceMuted(role: Role): boolean {
+    return this.mutedVoices.has(role);
+  }
+
+  getVoiceLevel(role: Role): number {
+    return this.voiceLevels.get(role) ?? 1;
+  }
+
+  private effectiveLayerGain(role: Role): number {
+    if (this.mutedVoices.has(role)) return 0;
+    return this.getLayerGainForRole(role) * (this.voiceLevels.get(role) ?? 1);
+  }
+
+  private applyVoiceGain(role: Role): void {
+    const layer = this.layers.get(role);
+    if (!layer) return;
+    layer.gainNode.gain.cancelScheduledValues(this.audioContext.currentTime);
+    layer.gainNode.gain.setValueAtTime(this.effectiveLayerGain(role), this.audioContext.currentTime);
+  }
+
+  /** Loop a time region (seconds) instead of the whole song. Null = whole song. */
+  setLoopRegion(region: { start: number; end: number } | null): void {
+    this.loopRegion = region && region.end - region.start > 1 ? region : null;
+    if (this.isPlaying && this.loopRegion) {
+      this.seek(this.loopRegion.start / Math.max(this.getDuration(), 0.001));
+    }
+  }
+
+  /** Band-limited pulse wave for classic 12.5% / 25% duty chip leads. */
+  private getPulseWave(duty: number): PeriodicWave {
+    let wave = this.pulseWaves.get(duty);
+    if (!wave) {
+      wave = SynthesisEngine.createPulseWave(this.audioContext, duty);
+      this.pulseWaves.set(duty, wave);
+    }
+    return wave;
+  }
+
+  private static createPulseWave(ctx: BaseAudioContext, duty: number): PeriodicWave {
+    const harmonics = 32;
+    const real = new Float32Array(harmonics);
+    const imag = new Float32Array(harmonics);
+    for (let n = 1; n < harmonics; n++) {
+      imag[n] = (2 / (n * Math.PI)) * Math.sin(n * Math.PI * duty);
+    }
+    return ctx.createPeriodicWave(real, imag);
+  }
+
   setupLayers(assignments: RoleAssignment[]): void {
     // Clean up existing layers
     this.cleanupLayers();
@@ -84,8 +154,20 @@ export class SynthesisEngine {
       }
     }
 
-    // Store role assignments and create layers
+    // Store role assignments and create layers. Multiple tracks can share a
+    // role (e.g. several texture tracks): merge their events instead of
+    // letting the last one overwrite the rest.
     for (const assignment of assignments) {
+      const existing = this.roleAssignments.get(assignment.role);
+      if (existing) {
+        existing.events = existing.events
+          .concat(assignment.events)
+          .sort((a, b) => a.time - b.time || a.pitch - b.pitch);
+        existing.chords = existing.chords
+          .concat(assignment.chords)
+          .sort((a, b) => a.time - b.time);
+        continue;
+      }
       const layer = this.createSynthLayer(assignment.role);
       this.layers.set(assignment.role, layer);
       this.roleAssignments.set(assignment.role, assignment);
@@ -200,18 +282,37 @@ export class SynthesisEngine {
   private createSynthLayer(role: Role): SynthLayer {
     const gainNode = this.audioContext.createGain();
     const filterNode = this.audioContext.createBiquadFilter();
-    
+
     filterNode.connect(gainNode);
     gainNode.connect(this.masterGain);
-    
+
     // Configure based on role
     this.configureLayerForRole(gainNode, filterNode, role);
-    
+
+    const extraNodes: AudioNode[] = [];
+    if (role === 'melody') {
+      // GB composers faked echo by repeating the lead quietly on the free
+      // pulse channel; a low-mix slapback delay gets the same feel.
+      const delay = this.audioContext.createDelay(1);
+      delay.delayTime.value = 0.165;
+      const feedback = this.audioContext.createGain();
+      feedback.gain.value = 0.18;
+      const wet = this.audioContext.createGain();
+      wet.gain.value = 0.25;
+      gainNode.connect(delay);
+      delay.connect(feedback);
+      feedback.connect(delay);
+      delay.connect(wet);
+      wet.connect(this.masterGain);
+      extraNodes.push(delay, feedback, wet);
+    }
+
     return {
       role,
       oscillators: [],
       gainNode,
-      filterNode
+      filterNode,
+      extraNodes
     };
   }
 
@@ -219,20 +320,23 @@ export class SynthesisEngine {
     switch (role) {
       case 'bass': return this.cleanArrangement ? 0.27 : 0.4;
       case 'drone': return 0.2;
-      case 'ostinato': return this.cleanArrangement ? 0.055 : 0.18;
+      // Square waves carry far more harmonic energy than triangles, so the
+      // pulse-style layers sit lower to keep the mix balanced.
+      case 'ostinato': return this.cleanArrangement ? 0.045 : 0.14;
       case 'texture': return this.cleanArrangement ? 0.032 : 0.045;
       case 'accents': return 0.5;
-      case 'melody': return this.cleanArrangement ? 0.3 : 0.35;
+      case 'melody': return this.cleanArrangement ? 0.22 : 0.26;
+      case 'percussion': return 0.5;
       default: return 0.3;
     }
   }
 
   private restoreLayerGain(gain: GainNode, role: Role): void {
-    gain.gain.setValueAtTime(this.getLayerGainForRole(role), this.audioContext.currentTime);
+    gain.gain.setValueAtTime(this.effectiveLayerGain(role), this.audioContext.currentTime);
   }
 
   private configureLayerForRole(gain: GainNode, filter: BiquadFilterNode, role: Role): void {
-    gain.gain.value = this.getLayerGainForRole(role);
+    gain.gain.value = this.effectiveLayerGain(role);
 
     switch (role) {
       case 'bass':
@@ -259,6 +363,11 @@ export class SynthesisEngine {
         filter.type = 'lowpass';
         filter.frequency.value = 2600;
         break;
+      case 'percussion':
+        // The noise hits bring their own per-hit filters.
+        filter.type = 'allpass';
+        filter.frequency.value = 1000;
+        break;
     }
   }
 
@@ -266,35 +375,105 @@ export class SynthesisEngine {
     return 440 * Math.pow(2, (midiNote - 69) / 12);
   }
 
+  private getNoiseBuffer(): AudioBuffer {
+    if (!this.noiseBuffer) {
+      const length = this.audioContext.sampleRate;
+      this.noiseBuffer = this.audioContext.createBuffer(1, length, this.audioContext.sampleRate);
+      const data = this.noiseBuffer.getChannelData(0);
+      for (let i = 0; i < length; i++) data[i] = Math.random() * 2 - 1;
+    }
+    return this.noiseBuffer;
+  }
+
+  /** Game Boy noise channel: filtered white-noise bursts for drum hits. */
+  private scheduleNoiseHit(layer: SynthLayer, pitch: number, velocity: number, when: number): void {
+    const source = this.audioContext.createBufferSource();
+    source.buffer = this.getNoiseBuffer();
+
+    const hitFilter = this.audioContext.createBiquadFilter();
+    const envelope = this.audioContext.createGain();
+    const isKick = pitch <= 38;
+    if (isKick) {
+      hitFilter.type = 'lowpass';
+      hitFilter.frequency.value = 220;
+    } else {
+      hitFilter.type = 'highpass';
+      hitFilter.frequency.value = 5200;
+    }
+
+    const decay = isKick ? 0.14 : 0.05;
+    const gainValue = velocity * (isKick ? 0.9 : 0.5);
+    envelope.gain.setValueAtTime(gainValue, when);
+    envelope.gain.exponentialRampToValueAtTime(0.001, when + decay);
+
+    source.connect(hitFilter);
+    hitFilter.connect(envelope);
+    envelope.connect(layer.filterNode);
+    source.start(when);
+    source.stop(when + decay + 0.02);
+
+    setTimeout(() => {
+      try {
+        source.disconnect();
+        hitFilter.disconnect();
+        envelope.disconnect();
+      } catch (e) {
+        // Already disconnected
+      }
+    }, (when - this.audioContext.currentTime + decay + 0.1) * 1000);
+  }
+
   private scheduleNote(role: Role, pitch: number, duration: number, velocity: number, when: number): void {
     const layer = this.layers.get(role);
     if (!layer) return;
-    
+
+    if (role === 'percussion') {
+      this.scheduleNoiseHit(layer, pitch, velocity, when);
+      return;
+    }
+
     const osc = this.audioContext.createOscillator();
     const envelope = this.audioContext.createGain();
-    
+
     // Convert MIDI pitch to frequency
     const frequency = this.midiToFrequency(pitch);
     osc.frequency.value = frequency;
-    
-    // Choose oscillator type based on role
+
+    // Game Boy timbres: thin pulse leads, soft wave-channel bass.
     switch (role) {
       case 'bass':
-        osc.type = this.cleanArrangement ? 'triangle' : 'square';
+        osc.type = 'triangle';
         break;
       case 'drone':
         osc.type = 'sawtooth';
         break;
       case 'ostinato':
-        osc.type = 'triangle';
+        osc.setPeriodicWave(this.getPulseWave(0.125));
         break;
       case 'melody':
-        osc.type = 'triangle';
+        osc.setPeriodicWave(this.getPulseWave(0.25));
         break;
       case 'texture':
       case 'accents':
         osc.type = 'sine';
         break;
+    }
+
+    // Delayed vibrato on sustained lead notes — the classic chip-lead touch.
+    let lfo: OscillatorNode | null = null;
+    let lfoDepth: GainNode | null = null;
+    if (role === 'melody' && duration > 0.25) {
+      lfo = this.audioContext.createOscillator();
+      lfo.frequency.value = 5.6;
+      lfoDepth = this.audioContext.createGain();
+      const vibratoStart = when + Math.min(0.2, duration * 0.4);
+      lfoDepth.gain.setValueAtTime(0, when);
+      lfoDepth.gain.setValueAtTime(0, vibratoStart);
+      lfoDepth.gain.linearRampToValueAtTime(14, vibratoStart + 0.12);
+      lfo.connect(lfoDepth);
+      lfoDepth.connect(osc.detune);
+      lfo.start(when);
+      lfo.stop(when + duration + 0.2);
     }
     
     osc.connect(envelope);
@@ -322,6 +501,8 @@ export class SynthesisEngine {
       try {
         osc.disconnect();
         envelope.disconnect();
+        lfo?.disconnect();
+        lfoDepth?.disconnect();
       } catch (e) {
         // Already disconnected
       }
@@ -330,10 +511,28 @@ export class SynthesisEngine {
 
   private scheduleEvents(): void {
     if (!this.isPlaying) return;
-    
+
+    // When looping a section, jump back to its start as we reach its end.
+    if (this.loopRegion) {
+      const songTime = this.audioContext.currentTime - this.startTime;
+      if (songTime >= this.loopRegion.end - 0.05) {
+        this.startTime = this.audioContext.currentTime - this.loopRegion.start;
+        for (const [role, assignment] of this.roleAssignments) {
+          let index = 0;
+          while (
+            index < assignment.events.length
+            && assignment.events[index].time < this.loopRegion.start
+          ) {
+            index++;
+          }
+          this.nextEventIndex.set(role, index);
+        }
+      }
+    }
+
     const currentTime = this.audioContext.currentTime;
     const scheduleUntil = currentTime + this.config.lookaheadTime;
-    
+
     // Schedule events for each role
     for (const [role, assignment] of this.roleAssignments) {
       this.scheduleRoleEvents(role, assignment, scheduleUntil);
@@ -355,10 +554,14 @@ export class SynthesisEngine {
     while (eventIndex < events.length) {
       const event = events[eventIndex];
       const eventTime = this.startTime + event.time;
-      
+
       // Stop if we're past the lookahead window
       if (eventTime > scheduleUntil) break;
-      
+
+      // Inside a loop region, don't schedule past its end — the scheduler
+      // jumps back to the region start instead.
+      if (this.loopRegion && event.time >= this.loopRegion.end) break;
+
       // Schedule if the event hasn't been played yet
       if (eventTime >= this.audioContext.currentTime) {
         this.scheduleNote(
@@ -376,8 +579,9 @@ export class SynthesisEngine {
     // Update the next event index
     this.nextEventIndex.set(role, eventIndex);
     
-    // Loop if we've reached the end
-    if (eventIndex >= events.length) {
+    // Loop the whole song when we reach the end (section loops are handled
+    // by the loop-region jump in scheduleEvents instead).
+    if (!this.loopRegion && eventIndex >= events.length) {
       this.nextEventIndex.set(role, 0);
       // Reset start time for looping
       if (Array.from(this.nextEventIndex.values()).every(idx => idx === 0)) {
@@ -417,8 +621,16 @@ export class SynthesisEngine {
       }
       layer.gainNode.disconnect();
       layer.filterNode.disconnect();
+      for (const node of layer.extraNodes ?? []) {
+        try {
+          node.disconnect();
+        } catch (e) {
+          // Already disconnected
+        }
+      }
     }
     this.layers.clear();
+    this.roleAssignments.clear();
   }
 
   /**
@@ -526,14 +738,30 @@ export class SynthesisEngine {
     filterNode.connect(gainNode);
     gainNode.connect(masterGain);
 
-    // Set gain based on role
+    if (role === 'melody') {
+      // Same slapback echo as the live melody layer.
+      const delay = ctx.createDelay(1);
+      delay.delayTime.value = 0.165;
+      const feedback = ctx.createGain();
+      feedback.gain.value = 0.18;
+      const wet = ctx.createGain();
+      wet.gain.value = 0.25;
+      gainNode.connect(delay);
+      delay.connect(feedback);
+      feedback.connect(delay);
+      delay.connect(wet);
+      wet.connect(masterGain);
+    }
+
+    // Set gain based on role (square layers sit lower than triangles)
     switch (role) {
       case 'bass': gainNode.gain.value = 0.4; break;
       case 'drone': gainNode.gain.value = 0.2; break;
-      case 'ostinato': gainNode.gain.value = 0.3; break;
+      case 'ostinato': gainNode.gain.value = 0.22; break;
       case 'texture': gainNode.gain.value = 0.1; break;
       case 'accents': gainNode.gain.value = 0.5; break;
-      case 'melody': gainNode.gain.value = 0.35; break;
+      case 'melody': gainNode.gain.value = 0.26; break;
+      case 'percussion': gainNode.gain.value = 0.5; break;
       default: gainNode.gain.value = 0.3;
     }
 
@@ -563,6 +791,10 @@ export class SynthesisEngine {
         filterNode.type = 'lowpass';
         filterNode.frequency.value = 4000;
         break;
+      case 'percussion':
+        filterNode.type = 'allpass';
+        filterNode.frequency.value = 1000;
+        break;
     }
 
     return { gainNode, filterNode };
@@ -574,14 +806,48 @@ export class SynthesisEngine {
 
   private static getOscillatorType(role: Role): OscillatorType {
     switch (role) {
-      case 'bass': return 'square';
+      case 'bass': return 'triangle';
       case 'drone': return 'sawtooth';
-      case 'ostinato': return 'triangle';
-      case 'melody': return 'triangle';
+      case 'ostinato': return 'square';
+      case 'melody': return 'square';
       case 'texture': return 'sine';
       case 'accents': return 'sine';
       default: return 'sine';
     }
+  }
+
+  /** Offline twin of scheduleNoiseHit for renders/exports. */
+  private static scheduleOfflineNoiseHit(
+    ctx: OfflineAudioContext,
+    filterNode: BiquadFilterNode,
+    pitch: number,
+    velocity: number,
+    when: number
+  ): void {
+    const length = Math.ceil(ctx.sampleRate * 0.2);
+    const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < length; i++) data[i] = Math.random() * 2 - 1;
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+
+    const hitFilter = ctx.createBiquadFilter();
+    const envelope = ctx.createGain();
+    const isKick = pitch <= 38;
+    hitFilter.type = isKick ? 'lowpass' : 'highpass';
+    hitFilter.frequency.value = isKick ? 220 : 5200;
+
+    const decay = isKick ? 0.14 : 0.05;
+    const gainValue = velocity * (isKick ? 0.9 : 0.5);
+    envelope.gain.setValueAtTime(gainValue, when);
+    envelope.gain.exponentialRampToValueAtTime(0.001, when + decay);
+
+    source.connect(hitFilter);
+    hitFilter.connect(envelope);
+    envelope.connect(filterNode);
+    source.start(when);
+    source.stop(when + decay + 0.02);
   }
 
   private static scheduleOfflineNote(
@@ -593,14 +859,40 @@ export class SynthesisEngine {
     velocity: number,
     when: number
   ): void {
+    if (role === 'percussion') {
+      SynthesisEngine.scheduleOfflineNoiseHit(ctx, filterNode, pitch, velocity, when);
+      return;
+    }
+
     const osc = ctx.createOscillator();
     const envelope = ctx.createGain();
 
     osc.frequency.value = SynthesisEngine.midiToFreq(pitch);
-    osc.type = SynthesisEngine.getOscillatorType(role);
+    if (role === 'melody') {
+      osc.setPeriodicWave(SynthesisEngine.createPulseWave(ctx, 0.25));
+    } else if (role === 'ostinato') {
+      osc.setPeriodicWave(SynthesisEngine.createPulseWave(ctx, 0.125));
+    } else {
+      osc.type = SynthesisEngine.getOscillatorType(role);
+    }
 
     osc.connect(envelope);
     envelope.connect(filterNode);
+
+    // Same delayed vibrato as the live lead.
+    if (role === 'melody' && duration > 0.25) {
+      const lfo = ctx.createOscillator();
+      lfo.frequency.value = 5.6;
+      const lfoDepth = ctx.createGain();
+      const vibratoStart = when + Math.min(0.2, duration * 0.4);
+      lfoDepth.gain.setValueAtTime(0, when);
+      lfoDepth.gain.setValueAtTime(0, vibratoStart);
+      lfoDepth.gain.linearRampToValueAtTime(14, vibratoStart + 0.12);
+      lfo.connect(lfoDepth);
+      lfoDepth.connect(osc.detune);
+      lfo.start(when);
+      lfo.stop(when + duration + 0.2);
+    }
 
     const gainValue = velocity * 0.5;
     const attackTime = Math.max(0.003, Math.min(0.025, duration * 0.06));

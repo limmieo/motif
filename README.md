@@ -2,110 +2,71 @@
 
 ![Songboy Logo](public/wariosynthlogo.png)
 
-Turn an audio recording into a cleaner, expressive Game Boy-inspired version.
-Upload a song or provide a YouTube link, and Songboy transcribes the
-performance, separates its musical roles, controls dense piano passages, and
-resynthesizes it in the browser.
+**Turn any song into Game Boy music.**
 
-This is not a strict four-channel Game Boy emulator. The goal is to preserve
-the identity, harmony, rhythm, and dynamics of the original performance while
-using chip-style tone as a musical color.
+Drop in a song — upload a file or paste a YouTube link — and Songboy listens
+to it, figures out the melody, bassline, and chords, cleans all of that up,
+and plays it back through your browser with that warm, chip-tune Game Boy
+sound. You can also search for an existing MIDI file online and run it
+through the same player.
 
-> Songboy is a fork of
-> [b1rdmania/motif](https://github.com/b1rdmania/motif), which introduced the
-> original MIDI search and Game Boy-style synthesis experience. This fork adds
-> audio transcription, piano-focused arrangement intelligence, source
-> separation, export tools, and an expanded player.
+## Why this exists
 
-## Features
+Most "make my song sound like a Game Boy" tools just slap a square-wave
+filter over the original audio, which sounds harsh and muddy. Songboy instead
+**actually transcribes the music** — it works out what notes are being
+played, separates the tune from the harmony and bass, and rebuilds the song
+note-by-note using real Game Boy-style synthesis (the same kind of pulse,
+triangle, and noise channels the original hardware had).
 
-### Audio transcription
+The result is closer to a chiptune cover of a song than a filtered recording
+of it — clean, musical, and genuinely fun to listen to. It's not a strict
+"only 4 sounds at once" emulator; the goal is to keep the original song
+recognizable while giving it that retro color.
 
-- Upload MP3, WAV, M4A, OGG, FLAC, AAC, WebM, or MP4 audio.
-- Transcribe permitted YouTube audio by URL.
-- Use a dedicated piano model with note velocity, offset, and sustain-pedal
-  detection.
-- Use Basic Pitch for general musical audio.
-- Detect timestamped audio chords with Chordino through `sonic-annotator`
-  when the native `nnls-chroma` Vamp plugin is installed.
-- Fall back to librosa chroma automatically when Chordino is unavailable.
-- Use music21 to check the MIDI key and symbolic harmony.
-- Correct only weak, short notes that disagree with both the audio chord and
-  detected key. Confident chromatic notes remain untouched.
-- On Windows, Sonic Annotator is detected automatically at
-  `C:\Tools\sonic-annotator-win64\sonic-annotator.exe`. A different location
-  can be selected with `SONIC_ANNOTATOR_PATH`.
-- Enter a known BPM or allow automatic tempo detection.
-- Cache completed transcriptions so repeated conversions load quickly.
+## How to use it
 
-### Automatic piano cleanup
+1. Start the app (see [Running it](#running-it) below).
+2. **Upload a song** (MP3, WAV, M4A, and most other common audio/video
+   formats) or **paste a YouTube link**.
+3. Wait while Songboy listens to the track — you'll see a progress bar while
+   it transcribes the music and works out the melody, bass, and chords.
+4. Hit **Play** to hear the Game Boy version. While it plays, you'll see a
+   scrolling piano-roll showing every note, which "voice" (melody/bass/chord)
+   it belongs to, and what chord is playing.
+5. Use the per-part volume sliders to turn the melody, bass, or chords up or
+   down — or mute any of them.
+6. Loop a section, jump around with the seek bar, or download the result as
+   a MIDI file or a WAV audio file.
 
-There is one faithful conversion workflow. Songboy automatically adapts
-to the performance instead of asking the user to choose an arrangement mode.
+You can also search for a song by name to find an existing MIDI file online
+and play that through the same Game Boy-style engine, without uploading
+anything.
 
-- Tracks the likely left and right hands across the performance.
-- Protects the melody, bass line, and important chord movement.
-- Limits quiet sustain-pedal buildup during crowded passages.
-- Preserves stronger phrase-ending notes across musical transitions.
-- Keeps fast arpeggios articulate with shorter releases.
-- Gives slower notes and phrase endings softer, longer tails.
-- Removes muddy low-register seconds and redundant octave doubling.
-- Reduces inner notes only when a passage becomes overloaded.
-- Uses adaptive onset grouping so fast runs are not mistaken for block chords.
+## What it actually does, in plain terms
 
-### Game Boy-inspired synthesis
+1. **Listens** — FFmpeg cleans up the audio, then a neural network "ear"
+   (Basic Pitch, or a dedicated piano model for piano recordings) works out
+   what notes are being played and when.
+2. **Understands the music** — it figures out the song's key and chords
+   (using Chordino/music21 when available, otherwise a simpler chroma-based
+   analysis), then quietly fixes notes that the transcription clearly got
+   wrong, while leaving intentional, interesting notes alone.
+3. **Arranges it** — the notes get split into a melody line, a bassline, and
+   chord/harmony parts, the way a person arranging a chiptune cover would do
+   it. Busy, muddy passages get gently simplified; everything else stays.
+4. **Optionally separates instruments first** — for full band/song mixes,
+   Songboy can run the audio through Demucs to pull out vocals, drums, bass,
+   and "everything else" before transcribing, so the piano part doesn't get
+   confused with the singer or the guitars.
+5. **Plays it back** — everything is re-synthesized live in your browser
+   using Web Audio (pulse waves with vibrato, a soft bass tone, and
+   noise-based drums) — no audio samples from the original recording are
+   used, it's all generated sound.
 
-- Pulse-wave lead and arpeggio voices.
-- Softer triangle bass and sine-based harmony.
-- White-noise kick, snare, and hi-hat synthesis.
-- Velocity-sensitive loudness and brightness.
-- Automatic chord loudness compensation.
-- Gentle filtering, compression, and stereo voice separation.
-- Matching live playback and offline WAV rendering.
+## Running it
 
-### Musician-friendly player
-
-- Scrolling piano-roll visualization in the original Game Boy palette.
-- Note names and octave guides.
-- Live display of the notes and musical voices currently sounding.
-- Pause and hover over a note to inspect its:
-  - pitch name
-  - MIDI number
-  - voice
-  - velocity
-  - start time
-  - duration
-- Per-voice volume and mute controls.
-- Section looping, seeking, MIDI download, and WAV export.
-
-### Full-song support
-
-Optional Demucs source separation splits a recording into vocals, drums, bass,
-and other material before transcription. This is slower, but it can improve
-results for complete mixes where several instruments compete with the piano.
-
-The original MIDI search workflow remains available: search for a song, select
-a MIDI result, and process it through the same player and synthesis engine.
-
-## How It Works
-
-1. Songboy receives an uploaded file or permitted YouTube URL.
-2. FFmpeg normalizes the audio.
-3. The selected neural model converts the recording into timed MIDI notes.
-4. The cleanup pipeline estimates tempo, applies gentle quantization, handles
-   pedal information, and removes likely transcription artifacts.
-5. Piano material is divided into melody, bass, and smoothly moving harmony
-   voices using hand-aware tracking.
-6. Automatic complexity control simplifies only the moments that would
-   otherwise become crowded or muddy.
-7. Web Audio oscillators render the result with a Game Boy-inspired timbre.
-
-All generated sound is synthesized. The player does not replay samples from
-the source recording.
-
-## Quick Start
-
-### Windows launcher
+### Windows: one-click launcher
 
 Double-click:
 
@@ -113,11 +74,10 @@ Double-click:
 Start Songboy.bat
 ```
 
-The launcher installs the Node dependencies, creates the Python environment,
-downloads the piano model when needed, starts the frontend and backend, and
-opens the app.
+This installs everything it needs (Node packages, Python environment, the
+piano transcription model), starts the app, and opens it in your browser.
 
-### Manual setup
+### Manual setup (any OS)
 
 Install the frontend and backend dependencies:
 
@@ -128,7 +88,7 @@ npm install
 cd ..
 ```
 
-Create the Python environment and install the transcription dependencies:
+Create the Python environment and install the audio-processing dependencies:
 
 ```powershell
 python -m venv server/.venv
@@ -150,42 +110,87 @@ npm run dev
 The backend runs on `http://localhost:3001`. Vite prints the frontend address
 when it starts.
 
-## Requirements
+### What you'll need
 
 - Node.js 20 or newer
 - Python 3.11 or earlier
-- FFmpeg
-- Approximately 165 MB for the piano transcription checkpoint
+- FFmpeg (set `FFMPEG_PATH` to `ffmpeg.exe` if it's not on your `PATH`)
+- About 165 MB of disk space for the piano transcription model
 
-Set `FFMPEG_PATH` to the full path of `ffmpeg.exe` if FFmpeg is not available
-on `PATH`.
-
-An NVIDIA GPU is optional. CUDA significantly speeds up piano transcription
-and source separation:
+Got an NVIDIA GPU? It'll make transcription and source separation much
+faster. The launcher tries to set this up automatically, or do it manually:
 
 ```powershell
 server/.venv/Scripts/python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128 --upgrade
 ```
 
-The Windows launcher attempts to configure the appropriate Torch build
-automatically.
+## A closer look at the features
+
+### Listening and transcription
+
+- Upload MP3, WAV, M4A, OGG, FLAC, AAC, WebM, or MP4 audio.
+- Or paste a YouTube link for permitted audio.
+- Dedicated piano model for solo piano (captures velocity, note length, and
+  sustain pedal).
+- Basic Pitch for everything else.
+- Chord detection via Chordino (`sonic-annotator`) when available, with a
+  librosa chroma fallback.
+- music21-based key/harmony check, used to gently correct only weak, short,
+  clearly-wrong notes — confident or intentional chromatic notes are left
+  alone.
+- Manual BPM entry or automatic tempo detection.
+- Finished transcriptions are cached, so re-running the same song is fast.
+
+### Automatic arrangement cleanup
+
+- Tracks the likely "two hands" of a piano performance.
+- Protects the melody, bassline, and important chord changes.
+- Tames sustain-pedal buildup in busy passages.
+- Keeps fast runs articulate; gives slow phrase endings a softer tail.
+- Removes muddy low notes, redundant doublings, and overcrowded chords —
+  only when a passage actually needs it.
+
+### Game Boy-style sound
+
+- Pulse-wave lead and arpeggio voices, with vibrato.
+- Soft triangle bass and sine-based harmony.
+- Noise-based kick, snare, and hi-hat.
+- Velocity-sensitive volume and brightness, automatic chord loudness
+  balancing, gentle compression and stereo spread.
+- Live playback and offline WAV export use the exact same sound engine.
+
+### The player
+
+- Scrolling piano-roll in the original Game Boy green palette.
+- Note names, octave guides, and live highlighting of what's playing.
+- Pause and hover any note to see its pitch, velocity, voice, timing, and any
+  correction that was applied.
+- Per-voice volume sliders and mute buttons.
+- Section looping, seeking, MIDI download, and WAV export.
+
+### Full songs, not just piano
+
+Optional Demucs source separation splits a full mix into vocals, drums, bass,
+and other instruments before transcription — slower, but it helps a lot when
+the piano part is competing with a full band.
+
+The original MIDI search workflow is still here too: search for a song by
+name, pick a result, and it plays through the same engine.
 
 ## Development
-
-Useful checks:
 
 ```bash
 npm run typecheck
 cd server && npm run build
 ```
 
-Piano cleanup tests:
+Arrangement/cleanup tests:
 
 ```powershell
 server/.venv/Scripts/python server/python/test_composer_mode.py
 ```
 
-## Tech Stack
+## Tech stack
 
 - Frontend: TypeScript, Vite, Web Audio API
 - Backend: Node.js, Express
@@ -193,11 +198,11 @@ server/.venv/Scripts/python server/python/test_composer_mode.py
 - Transcription: piano-transcription-inference, Basic Pitch
 - Source separation: Demucs
 
-## Responsible Use
+## Responsible use
 
-Only download, upload, transcribe, or redistribute audio that you own or have
-permission to use. Transforming a recording does not automatically grant
-copyright permission or prevent content claims.
+Only upload, transcribe, or share audio you own or have permission to use.
+Turning a recording into a chiptune version doesn't grant copyright
+permission or prevent content claims.
 
 ## Credits
 
@@ -206,7 +211,7 @@ Forked from [motif](https://github.com/b1rdmania/motif) by
 interface, MIDI search, and synthesis foundation.
 
 This fork adds the audio-to-MIDI pipeline, piano transcription, automatic
-arrangement and pedal cleanup, source separation, WAV export, and the expanded
-musician-focused visualizer.
+arrangement and pedal cleanup, source separation, harmony analysis, WAV
+export, and the expanded musician-focused player.
 
 ![Songboy](public/wario-sprite.png)

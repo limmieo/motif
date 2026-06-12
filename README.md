@@ -1,9 +1,9 @@
-# Wario Synth
+# Songboy
 
-![Wario Synth Logo](public/wariosynthlogo.png)
+![Songboy Logo](public/wariosynthlogo.png)
 
 Turn an audio recording into a cleaner, expressive Game Boy-inspired version.
-Upload a song or provide a YouTube link, and Wario Synth transcribes the
+Upload a song or provide a YouTube link, and Songboy transcribes the
 performance, separates its musical roles, controls dense piano passages, and
 resynthesizes it in the browser.
 
@@ -11,7 +11,7 @@ This is not a strict four-channel Game Boy emulator. The goal is to preserve
 the identity, harmony, rhythm, and dynamics of the original performance while
 using chip-style tone as a musical color.
 
-> Wario Synth is a fork of
+> Songboy is a fork of
 > [b1rdmania/motif](https://github.com/b1rdmania/motif), which introduced the
 > original MIDI search and Game Boy-style synthesis experience. This fork adds
 > audio transcription, piano-focused arrangement intelligence, source
@@ -40,7 +40,7 @@ using chip-style tone as a musical color.
 
 ### Automatic piano cleanup
 
-There is one faithful conversion workflow. Wario Synth automatically adapts
+There is one faithful conversion workflow. Songboy automatically adapts
 to the performance instead of asking the user to choose an arrangement mode.
 
 - Tracks the likely left and right hands across the performance.
@@ -89,7 +89,7 @@ a MIDI result, and process it through the same player and synthesis engine.
 
 ## How It Works
 
-1. Wario Synth receives an uploaded file or permitted YouTube URL.
+1. Songboy receives an uploaded file or permitted YouTube URL.
 2. FFmpeg normalizes the audio.
 3. The selected neural model converts the recording into timed MIDI notes.
 4. The cleanup pipeline estimates tempo, applies gentle quantization, handles
@@ -110,7 +110,7 @@ the source recording.
 Double-click:
 
 ```text
-Start Wario Synth.bat
+Start Songboy.bat
 ```
 
 The launcher installs the Node dependencies, creates the Python environment,
@@ -209,4 +209,4 @@ This fork adds the audio-to-MIDI pipeline, piano transcription, automatic
 arrangement and pedal cleanup, source separation, WAV export, and the expanded
 musician-focused visualizer.
 
-![Wario](public/wario-sprite.png)
+![Songboy](public/wario-sprite.png)

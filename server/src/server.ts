@@ -695,7 +695,7 @@ app.get('/s/:code', async (req, res) => {
     const imageUrl = origin ? `${origin}/warioX.png` : '/warioX.png';
 
     const sharedTitle = (payload.title || '').trim();
-    const ogTitle = sharedTitle ? `${sharedTitle} - Wario Synth` : 'Wario Synth 8-Bit Midi';
+    const ogTitle = sharedTitle ? `${sharedTitle} - Songboy` : 'Songboy 8-Bit Midi';
     const ogDescription = sharedTitle
       ? `I made ${sharedTitle} Game Boy version. Click to listen or generate your own.`
       : 'Turn any song into a Game Boy version';

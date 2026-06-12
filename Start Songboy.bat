@@ -2,9 +2,9 @@
 setlocal
 
 cd /d "%~dp0"
-title Wario Synth Launcher
+title Songboy Launcher
 
-echo Starting Wario Synth...
+echo Starting Songboy...
 
 if not exist "node_modules" (
     echo Installing frontend dependencies...
@@ -76,12 +76,12 @@ if "%FRONTEND_READY%"=="0" (
       "Start-Process -WindowStyle Hidden -FilePath 'npm.cmd' -ArgumentList 'run','dev','--','--host','127.0.0.1','--port','3000' -WorkingDirectory '%~dp0'"
 )
 
-echo Waiting for Wario Synth...
+echo Waiting for Songboy...
 powershell -NoProfile -Command ^
   "$url='http://127.0.0.1:3000'; for ($i=0; $i -lt 60; $i++) { try { $r=Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 $url; if ($r.StatusCode -eq 200) { Start-Process $url; exit 0 } } catch {}; Start-Sleep -Seconds 1 }; exit 1"
 
 if errorlevel 1 (
-    echo Wario Synth did not start. Check that Node.js and Python are installed.
+    echo Songboy did not start. Check that Node.js and Python are installed.
     pause
     exit /b 1
 )
@@ -93,3 +93,4 @@ echo.
 echo Setup failed. Check that Node.js and Python 3.10 or 3.11 are installed.
 pause
 exit /b 1
+

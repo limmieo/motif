@@ -1179,7 +1179,7 @@ class MotifApp {
       this.updateStatus('No MIDI is loaded to download.');
       return;
     }
-    const name = `${this.sanitizeFileName(this.selectedTitle.textContent || 'wario-synth')}.mid`;
+    const name = `${this.sanitizeFileName(this.selectedTitle.textContent || 'songboy')}.mid`;
     this.triggerDownload(new Blob([buffer], { type: 'audio/midi' }), name);
   }
 
@@ -1202,7 +1202,7 @@ class MotifApp {
         44100,
         { arrangementMode }
       );
-      const name = `${this.sanitizeFileName(this.selectedTitle.textContent || 'wario-synth')}.wav`;
+      const name = `${this.sanitizeFileName(this.selectedTitle.textContent || 'songboy')}.wav`;
       this.triggerDownload(MotifApp.audioBufferToWavBlob(rendered), name);
       this.updateStatus('');
     } catch (error) {
@@ -1215,7 +1215,7 @@ class MotifApp {
   private sanitizeFileName(name: string): string {
     return (
       name.replace(/[^a-z0-9\- _]/gi, '').trim().replace(/\s+/g, '-').toLowerCase()
-      || 'wario-synth'
+      || 'songboy'
     );
   }
 
@@ -1513,7 +1513,7 @@ class MotifApp {
     }
 
     // Compose tweet text
-    const tweetText = `I made a Game Boy version of ${title}\n\nUsing @b1rdmania's Wario Synthesis Midi Engine\n\nCheck it out here`;
+    const tweetText = `I made a Game Boy version of ${title}\n\nMade with Songboy, built on @b1rdmania's Motif synthesis engine\n\nCheck it out here`;
     const twitterUrl = `https://twitter.com/intent/tweet?text=${encodeURIComponent(tweetText)}&url=${encodeURIComponent(shareUrl)}`;
 
     // Navigate the already-opened window

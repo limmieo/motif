@@ -38,6 +38,26 @@ export interface AudioTranscriptionResult {
   bpm?: number;
   bpmSource?: string;
   sections?: number[];
+  analysis?: {
+    chord_source?: string;
+    key?: string;
+    summary?: Record<string, number>;
+    events?: Array<{
+      time: number;
+      duration: number;
+      pitch: number;
+      original_pitch: number;
+      confidence: number;
+      status: 'corrected' | 'removed' | 'conflict';
+      reason?: string;
+      chord?: string | null;
+    }>;
+    chords?: Array<{
+      start: number;
+      end: number;
+      label: string;
+    }>;
+  };
 }
 
 export interface AudioTranscriptionProgress {
@@ -227,12 +247,16 @@ export class MIDIService {
 
       onProgress?.({ status: progress.status, percent, label });
       if (progress.status === 'done') {
-        const resultResponse = await this.fetchWithRetry(
-          `${this.baseUrl}/api/audio/transcription/${encodeURIComponent(started.jobId)}/result`,
-          undefined,
-          60000
-        );
-        return this.readTranscription(resultResponse);
+        const jobPath = `${this.baseUrl}/api/audio/transcription/${encodeURIComponent(started.jobId)}`;
+        const [resultResponse, analysisResponse] = await Promise.all([
+          this.fetchWithRetry(`${jobPath}/result`, undefined, 60000),
+          this.fetchWithRetry(`${jobPath}/analysis`, undefined, 60000),
+        ]);
+        const result = await this.readTranscription(resultResponse);
+        if (analysisResponse.ok) {
+          result.analysis = await analysisResponse.json();
+        }
+        return result;
       }
 
       await new Promise<void>(resolve => window.setTimeout(resolve, 600));

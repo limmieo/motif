@@ -21,8 +21,8 @@ export class MotifEngine {
 
   constructor() {
     this.config = {
-      lookaheadTime: 0.1,
-      scheduleInterval: 25,
+      lookaheadTime: 0.18,
+      scheduleInterval: 20,
       fadeTime: 0.05,
       maxOscillators: 8
     };
@@ -223,30 +223,51 @@ export class MotifEngine {
     const voices = new Map<Role, NoteEvent[]>([
       ['bass', []],
       ['texture', []],
+      ['ostinato', []],
       ['melody', []],
     ]);
+    const groups = this.groupByOnset(this.removePianoBlips(events));
+    let leftCenter = 45;
+    let rightCenter = 67;
+    let texturePitch: number | null = null;
+    let ostinatoPitch: number | null = null;
 
-    for (const group of this.groupByOnset(events)) {
-      const ordered = [...group].sort((a, b) => a.pitch - b.pitch);
+    for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+      const ordered = this.limitPianoComplexity(groups, groupIndex, lightweightMode);
       if (ordered.length === 1) {
         const note = ordered[0];
-        const role: Role = note.pitch < 48 ? 'bass' : 'melody';
+        const leftDistance = Math.abs(note.pitch - leftCenter);
+        const rightDistance = Math.abs(note.pitch - rightCenter);
+        const role: Role = note.pitch < 52 && leftDistance + 3 < rightDistance ? 'bass' : 'melody';
         voices.get(role)!.push(note);
+        if (role === 'bass') leftCenter = this.followPitch(leftCenter, note.pitch);
+        else rightCenter = this.followPitch(rightCenter, note.pitch);
         continue;
       }
 
-      voices.get('bass')!.push(ordered[0]);
-      voices.get('melody')!.push(ordered[ordered.length - 1]);
-      if (ordered.length > 2) {
-        const innerVoices = ordered.slice(1, -1);
-        const center = innerVoices.reduce((sum, note) => sum + note.pitch, 0) / innerVoices.length;
-        // Full quality: keep all inner voices unless Lightweight Mode asks
-        // for the stripped-down version.
-        voices.get('texture')!.push(
-          ...innerVoices
-            .sort((a, b) => Math.abs(a.pitch - center) - Math.abs(b.pitch - center))
-            .slice(0, lightweightMode ? 1 : innerVoices.length)
-        );
+      const splitPoint = this.findHandSplit(ordered, leftCenter, rightCenter);
+      let leftHand = ordered.filter(note => note.pitch <= splitPoint);
+      let rightHand = ordered.filter(note => note.pitch > splitPoint);
+      if (leftHand.length === 0) leftHand = [rightHand.shift()!];
+      if (rightHand.length === 0) rightHand = [leftHand.pop()!];
+
+      const bass = leftHand[0];
+      const melody = rightHand[rightHand.length - 1];
+      voices.get('bass')!.push(bass);
+      voices.get('melody')!.push(melody);
+      leftCenter = this.followPitch(leftCenter, bass.pitch);
+      rightCenter = this.followPitch(rightCenter, melody.pitch);
+
+      const harmony = leftHand.slice(1).concat(rightHand.slice(0, -1));
+      for (const note of harmony) {
+        const textureDistance = texturePitch === null ? 0 : Math.abs(note.pitch - texturePitch);
+        const ostinatoDistance = ostinatoPitch === null ? 0 : Math.abs(note.pitch - ostinatoPitch);
+        const role: Role = texturePitch === null || textureDistance <= ostinatoDistance
+          ? 'texture'
+          : 'ostinato';
+        voices.get(role)!.push(note);
+        if (role === 'texture') texturePitch = note.pitch;
+        else ostinatoPitch = note.pitch;
       }
     }
 
@@ -255,6 +276,7 @@ export class MotifEngine {
       if (voiceEvents.length === 0) continue;
       voiceEvents.sort((a, b) => a.time - b.time || a.pitch - b.pitch);
       this.trimVoiceOverlap(voiceEvents, role, lightweightMode);
+      this.cleanDensePianoVoice(voiceEvents, role);
       assignments.push({
         role,
         sourceTrack: voiceEvents[0].track,
@@ -267,24 +289,180 @@ export class MotifEngine {
     return assignments;
   }
 
+  private removePianoBlips(events: NoteEvent[]): NoteEvent[] {
+    const sorted = [...events].sort((a, b) => a.time - b.time || a.pitch - b.pitch);
+    const medianVelocity = [...sorted]
+      .map(event => event.velocity)
+      .sort((a, b) => a - b)[Math.floor(sorted.length / 2)] ?? 0.5;
+
+    return sorted.filter((event, index) => {
+      if (event.duration >= 0.045) return true;
+
+      const previous = sorted[index - 1];
+      const next = sorted[index + 1];
+      const closeToNeighbor = [previous, next].some(neighbor =>
+        neighbor !== undefined
+        && Math.abs(neighbor.time - event.time) <= 0.08
+        && Math.abs(neighbor.pitch - event.pitch) <= 4
+      );
+
+      // A sub-45 ms piano detection is normally an onset fragment. Retain
+      // only unusually strong events that clearly belong to a nearby run.
+      return event.velocity >= medianVelocity * 1.2 && closeToNeighbor;
+    });
+  }
+
+  private limitPianoComplexity(
+    groups: NoteEvent[][],
+    groupIndex: number,
+    lightweightMode: boolean
+  ): NoteEvent[] {
+    const group = [...groups[groupIndex]].sort((a, b) => a.pitch - b.pitch);
+    if (group.length <= 2) return group;
+
+    // Remove muddy low-register seconds and redundant inner octave doubles.
+    const cleaned: NoteEvent[] = [];
+    for (const note of group) {
+      const previous = cleaned[cleaned.length - 1];
+      if (previous && note.pitch < 55 && note.pitch - previous.pitch <= 2) {
+        if (note.velocity > previous.velocity * 1.15) cleaned[cleaned.length - 1] = note;
+        continue;
+      }
+      const octaveDuplicate = cleaned.find(
+        existing => existing.pitch % 12 === note.pitch % 12
+          && note.pitch - existing.pitch === 12
+          && existing !== cleaned[0]
+      );
+      if (octaveDuplicate && note !== group[group.length - 1]) {
+        if (note.velocity > octaveDuplicate.velocity) {
+          cleaned[cleaned.indexOf(octaveDuplicate)] = note;
+        }
+        continue;
+      }
+      cleaned.push(note);
+    }
+
+    const previousTime = groupIndex > 0 ? groups[groupIndex - 1][0].time : group[0].time;
+    const nextTime = groupIndex + 1 < groups.length
+      ? groups[groupIndex + 1][0].time
+      : group[0].time + 0.5;
+    const localGap = Math.min(
+      groupIndex > 0 ? group[0].time - previousTime : Number.POSITIVE_INFINITY,
+      nextTime - group[0].time
+    );
+    const localOnsets = groups.filter(
+      candidate => Math.abs(candidate[0].time - group[0].time) <= 0.35
+    ).length;
+    const burst = localOnsets >= 8;
+    const maxNotes = lightweightMode
+      ? 3
+      : burst && localGap < 0.12
+        ? 4
+        : localGap < 0.085
+          ? 4
+          : localGap < 0.14
+            ? 5
+            : 6;
+    if (cleaned.length <= maxNotes) return cleaned.sort((a, b) => a.pitch - b.pitch);
+
+    const selected = new Set<NoteEvent>([cleaned[0], cleaned[cleaned.length - 1]]);
+    const candidates = cleaned.slice(1, -1).sort((a, b) => {
+      const aScore = a.velocity + Math.min(a.duration, 0.5) * 30;
+      const bScore = b.velocity + Math.min(b.duration, 0.5) * 30;
+      return bScore - aScore;
+    });
+    for (const note of candidates) {
+      if (selected.size >= maxNotes) break;
+      const clashes = [...selected].some(existing => Math.abs(existing.pitch - note.pitch) <= 1);
+      if (!clashes) selected.add(note);
+    }
+    return [...selected].sort((a, b) => a.pitch - b.pitch);
+  }
+
+  private findHandSplit(notes: NoteEvent[], leftCenter: number, rightCenter: number): number {
+    let bestIndex = 0;
+    let bestScore = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < notes.length - 1; index++) {
+      const left = notes.slice(0, index + 1);
+      const right = notes.slice(index + 1);
+      const leftAverage = left.reduce((sum, note) => sum + note.pitch, 0) / left.length;
+      const rightAverage = right.reduce((sum, note) => sum + note.pitch, 0) / right.length;
+      const crossingPenalty = Math.max(0, 5 - (right[0].pitch - left[left.length - 1].pitch)) * 2;
+      const score = Math.abs(leftAverage - leftCenter)
+        + Math.abs(rightAverage - rightCenter)
+        + crossingPenalty;
+      if (score < bestScore) {
+        bestScore = score;
+        bestIndex = index;
+      }
+    }
+    return (notes[bestIndex].pitch + notes[bestIndex + 1].pitch) / 2;
+  }
+
+  private followPitch(current: number, next: number): number {
+    return current + (next - current) * 0.28;
+  }
+
+  private cleanDensePianoVoice(events: NoteEvent[], role: Role): void {
+    if (events.length < 3) return;
+
+    for (let index = 0; index < events.length; index++) {
+      const event = events[index];
+      const nearby = events.filter(
+        candidate => Math.abs(candidate.time - event.time) <= 0.35
+      ).length;
+      if (nearby < 6) continue;
+
+      const next = events[index + 1];
+      const gap = next ? next.time - event.time : Number.POSITIVE_INFINITY;
+      if (role === 'texture' || role === 'ostinato') {
+        // Staggered chord fragments can overlap into a large wash even when
+        // each individual onset is modest. Gate and duck only these inner
+        // voices during bursts; the outer melody and bass remain intact.
+        if (gap > 0.015 && gap < 0.18) {
+          event.duration = Math.min(event.duration, Math.max(0.035, gap * 0.62));
+        }
+        event.velocity *= nearby >= 10 ? 0.68 : 0.78;
+      } else if (role === 'bass' && gap > 0.015 && gap < 0.1) {
+        event.duration = Math.min(event.duration, Math.max(0.04, gap * 0.85));
+      }
+    }
+  }
+
   private trimVoiceOverlap(events: NoteEvent[], role: Role, lightweightMode: boolean): void {
     const groups = this.groupByOnset(events);
-    const overlap = lightweightMode ? 0 : role === 'texture' ? 0.03 : 0.015;
 
     for (let index = 0; index < groups.length - 1; index++) {
       const nextOnset = groups[index + 1][0].time;
       for (const event of groups[index]) {
+        const gap = nextOnset - event.time;
+        const nextGroup = groups[index + 1];
+        const nearestNextPitch = Math.min(
+          ...nextGroup.map(next => Math.abs(next.pitch - event.pitch))
+        );
+        const phraseBoundary = gap >= 0.16 && nearestNextPitch >= 5;
+        const strongEnding = event.duration >= gap * 1.15 && event.velocity >= 0.55;
+        const overlap = lightweightMode || gap < 0.09
+          ? 0
+          : phraseBoundary && strongEnding && role === 'melody'
+            ? Math.min(0.14, gap * 0.5)
+            : phraseBoundary && strongEnding && role === 'bass'
+              ? Math.min(0.08, gap * 0.3)
+          : role === 'texture' || role === 'ostinato'
+            ? 0.02
+            : 0.012;
         const latestEnd = nextOnset + overlap;
         if (event.time < nextOnset && event.time + event.duration > latestEnd) {
-          event.duration = Math.max(0.06, latestEnd - event.time);
+          const minimumDuration = Math.max(0.025, Math.min(0.06, gap * 0.75));
+          event.duration = Math.max(minimumDuration, latestEnd - event.time);
         }
       }
     }
   }
 
   private groupByOnset(events: NoteEvent[]): NoteEvent[][] {
-    const windowSeconds = 0.055;
     const sorted = [...events].sort((a, b) => a.time - b.time || a.pitch - b.pitch);
+    const windowSeconds = this.getOnsetWindow(sorted);
     const groups: NoteEvent[][] = [];
 
     for (const event of sorted) {
@@ -296,6 +474,28 @@ export class MotifEngine {
       }
     }
     return groups;
+  }
+
+  private getOnsetWindow(events: NoteEvent[]): number {
+    const distinctOnsets: number[] = [];
+    for (const event of events) {
+      const previous = distinctOnsets[distinctOnsets.length - 1];
+      if (previous === undefined || event.time - previous > 0.008) {
+        distinctOnsets.push(event.time);
+      }
+    }
+
+    const gaps = distinctOnsets
+      .slice(1)
+      .map((time, index) => time - distinctOnsets[index])
+      .filter(gap => gap > 0.012 && gap < 0.5)
+      .sort((a, b) => a - b);
+    if (gaps.length === 0) return 0.04;
+
+    const medianGap = gaps[Math.floor(gaps.length / 2)];
+    if (medianGap < 0.075) return 0.022;
+    if (medianGap < 0.12) return 0.03;
+    return 0.04;
   }
 
   private describeVoice(events: NoteEvent[]): TrackFeatures {

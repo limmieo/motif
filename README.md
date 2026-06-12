@@ -1,138 +1,212 @@
-# Wario Synth — Turn Any Audio Into Game Boy Music
+# Wario Synth
 
 ![Wario Synth Logo](public/wariosynthlogo.png)
 
-Drop in a song — an audio file or a YouTube link — and hear it rewritten for
-Game Boy hardware. **WAH!** 🎮
+Turn an audio recording into a cleaner, expressive Game Boy-inspired version.
+Upload a song or provide a YouTube link, and Wario Synth transcribes the
+performance, separates its musical roles, controls dense piano passages, and
+resynthesizes it in the browser.
 
-No MIDI file required. A local AI pipeline transcribes the audio, cleans it
-up with music theory, rearranges it the way a real chiptune composer would,
-and plays it through a homebrew Game Boy sound chip running in your browser.
+This is not a strict four-channel Game Boy emulator. The goal is to preserve
+the identity, harmony, rhythm, and dynamics of the original performance while
+using chip-style tone as a musical color.
 
-> This is a fork of [b1rdmania/motif](https://github.com/b1rdmania/motif),
-> which plays MIDI files found online through a Game Boy-style synth. This
-> fork solves the *input* problem: you bring audio, not MIDI.
+> Wario Synth is a fork of
+> [b1rdmania/motif](https://github.com/b1rdmania/motif), which introduced the
+> original MIDI search and Game Boy-style synthesis experience. This fork adds
+> audio transcription, piano-focused arrangement intelligence, source
+> separation, export tools, and an expanded player.
 
-## What This Fork Adds
+## Features
 
-- **Audio-to-MIDI transcription** — upload an audio file or paste a YouTube
-  link. Two neural models to choose from: a dedicated piano model with note
-  offset, velocity, and sustain-pedal detection, or Basic Pitch for
-  everything else.
-- **Source separation** — optionally split the mix into vocals / drums /
-  bass / other with Demucs before transcribing, so each part is heard
-  cleanly. Drums land on the noise channel as real kick and hat hits.
-- **MIDI cleanup intelligence** — key inference, correction of likely
-  transcription errors, tempo + section detection, and gentle quantization,
-  so the synth gets music instead of noise.
-- **Composer Mode** — dense transcriptions are rewritten for Game Boy
-  hardware instead of converted note-for-note (see below).
-- **Chip-authentic sound** — 12.5%/25% duty pulse leads with delayed
-  vibrato, slapback echo, triangle wave-channel bass, and white-noise
-  percussion. The Game Boy timbre without the hardware limits: full
-  polyphony, every voice plays.
-- **Player extras** — a scrolling piano-roll visualizer in the original
-  Game Boy green palette, style presets (Normal / Spooky / Dance), per-voice
-  mute/volume mixer, loop-a-section mode, live progress bar, transcription
-  caching, and MIDI/WAV downloads.
-- **One-click Windows launcher** — `Start Wario Synth.bat` installs
-  everything (Node deps, Python venv, the transcription models) and opens
-  the app.
+### Audio transcription
 
-## Composer Mode
+- Upload MP3, WAV, M4A, OGG, FLAC, AAC, WebM, or MP4 audio.
+- Transcribe permitted YouTube audio by URL.
+- Use a dedicated piano model with note velocity, offset, and sustain-pedal
+  detection.
+- Use Basic Pitch for general musical audio.
+- Detect timestamped audio chords with Chordino through `sonic-annotator`
+  when the native `nnls-chroma` Vamp plugin is installed.
+- Fall back to librosa chroma automatically when Chordino is unavailable.
+- Use music21 to check the MIDI key and symbolic harmony.
+- Correct only weak, short notes that disagree with both the audio chord and
+  detected key. Confident chromatic notes remain untouched.
+- On Windows, Sonic Annotator is detected automatically at
+  `C:\Tools\sonic-annotator-win64\sonic-annotator.exe`. A different location
+  can be selected with `SONIC_ANNOTATOR_PATH`.
+- Enter a known BPM or allow automatic tempo detection.
+- Cache completed transcriptions so repeated conversions load quickly.
 
-A piano cover can land ten simultaneous notes. The Game Boy has three
-pitched channels. Converting every note literally means dropping most of
-them at random — so instead, the pipeline rewrites dense passages the way a
-chiptune composer would have:
+### Automatic piano cleanup
 
-- the **skyline** (top voice) becomes the melody on pulse 1
-- the **floor** (lowest voice) becomes the bass on the wave channel
-- the **inner chord tones** collapse into a fast sixteenth-note arpeggio on
-  pulse 2
+There is one faithful conversion workflow. Wario Synth automatically adapts
+to the performance instead of asking the user to choose an arrangement mode.
 
-Sustained melody notes keep the skyline (chord stabs underneath don't steal
-the lead), monophonic material passes through untouched, and the UI tells
-you when an arrangement was applied. Run the transcriber with
-`--arrange off` if you want the literal transcription instead.
+- Tracks the likely left and right hands across the performance.
+- Protects the melody, bass line, and important chord movement.
+- Limits quiet sustain-pedal buildup during crowded passages.
+- Preserves stronger phrase-ending notes across musical transitions.
+- Keeps fast arpeggios articulate with shorter releases.
+- Gives slower notes and phrase endings softer, longer tails.
+- Removes muddy low-register seconds and redundant octave doubling.
+- Reduces inner notes only when a passage becomes overloaded.
+- Uses adaptive onset grouping so fast runs are not mistaken for block chords.
+
+### Game Boy-inspired synthesis
+
+- Pulse-wave lead and arpeggio voices.
+- Softer triangle bass and sine-based harmony.
+- White-noise kick, snare, and hi-hat synthesis.
+- Velocity-sensitive loudness and brightness.
+- Automatic chord loudness compensation.
+- Gentle filtering, compression, and stereo voice separation.
+- Matching live playback and offline WAV rendering.
+
+### Musician-friendly player
+
+- Scrolling piano-roll visualization in the original Game Boy palette.
+- Note names and octave guides.
+- Live display of the notes and musical voices currently sounding.
+- Pause and hover over a note to inspect its:
+  - pitch name
+  - MIDI number
+  - voice
+  - velocity
+  - start time
+  - duration
+- Per-voice volume and mute controls.
+- Section looping, seeking, MIDI download, and WAV export.
+
+### Full-song support
+
+Optional Demucs source separation splits a recording into vocals, drums, bass,
+and other material before transcription. This is slower, but it can improve
+results for complete mixes where several instruments compete with the piano.
+
+The original MIDI search workflow remains available: search for a song, select
+a MIDI result, and process it through the same player and synthesis engine.
 
 ## How It Works
 
-1. You drop in an audio file or YouTube link
-2. yt-dlp + FFmpeg fetch and normalize the audio
-3. A neural model (the piano model or Basic Pitch) transcribes it to notes
-4. Cleanup pass: key inference, pitch-error correction, tempo estimation,
-   quantization
-5. Composer Mode separates the voices: melody / bass / arpeggio
-6. The synthesis engine maps the voices to four Game Boy channels:
-   - 🟨 **Pulse 1** — lead melody
-   - 🟨 **Pulse 2** — arpeggio / harmony
-   - 🟩 **Wave** — bass
-   - ⬜ **Noise** — percussion
-7. Web Audio oscillators generate the sound — zero samples, zero server
-   audio
+1. Wario Synth receives an uploaded file or permitted YouTube URL.
+2. FFmpeg normalizes the audio.
+3. The selected neural model converts the recording into timed MIDI notes.
+4. The cleanup pipeline estimates tempo, applies gentle quantization, handles
+   pedal information, and removes likely transcription artifacts.
+5. Piano material is divided into melody, bass, and smoothly moving harmony
+   voices using hand-aware tracking.
+6. Automatic complexity control simplifies only the moments that would
+   otherwise become crowded or muddy.
+7. Web Audio oscillators render the result with a Game Boy-inspired timbre.
 
-The original MIDI-search path still works too: search a song name, pick a
-MIDI result, and play it through the same synth.
+All generated sound is synthesized. The player does not replay samples from
+the source recording.
 
-## Quick Start (Windows)
+## Quick Start
 
-Double-click **`Start Wario Synth.bat`**. It installs the frontend and
-backend dependencies, sets up the Python transcription environment,
-downloads the piano model (one-time 165 MB), starts both servers, and opens
-the app.
+### Windows launcher
 
-## Quick Start (Manual)
+Double-click:
 
-```bash
-# Install frontend deps
-npm install
-
-# Install backend deps
-cd server && npm install && cd ..
-
-# Run backend (http://localhost:3001)
-npm run dev:backend
-
-# Run frontend (Vite prints the URL, typically http://localhost:5173)
-npm run dev
+```text
+Start Wario Synth.bat
 ```
 
-### Audio transcription setup
+The launcher installs the Node dependencies, creates the Python environment,
+downloads the piano model when needed, starts the frontend and backend, and
+opens the app.
 
-The audio pipeline requires Python 3.11 or earlier, FFmpeg, and the Python
-dependencies:
+### Manual setup
+
+Install the frontend and backend dependencies:
 
 ```bash
+npm install
+cd server
+npm install
+cd ..
+```
+
+Create the Python environment and install the transcription dependencies:
+
+```powershell
 python -m venv server/.venv
 server/.venv/Scripts/python -m pip install -r server/requirements-audio.txt
 ```
 
-Set `FFMPEG_PATH` if `ffmpeg` is not on your `PATH`. YouTube downloading is
-intended only for media you own or have permission to download.
-
-If you have an NVIDIA GPU, install the CUDA build of torch for much faster
-separation and piano transcription (the launcher does this automatically):
+Start the backend:
 
 ```bash
+npm run dev:backend
+```
+
+Start the frontend in another terminal:
+
+```bash
+npm run dev
+```
+
+The backend runs on `http://localhost:3001`. Vite prints the frontend address
+when it starts.
+
+## Requirements
+
+- Node.js 20 or newer
+- Python 3.11 or earlier
+- FFmpeg
+- Approximately 165 MB for the piano transcription checkpoint
+
+Set `FFMPEG_PATH` to the full path of `ffmpeg.exe` if FFmpeg is not available
+on `PATH`.
+
+An NVIDIA GPU is optional. CUDA significantly speeds up piano transcription
+and source separation:
+
+```powershell
 server/.venv/Scripts/python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128 --upgrade
+```
+
+The Windows launcher attempts to configure the appropriate Torch build
+automatically.
+
+## Development
+
+Useful checks:
+
+```bash
+npm run typecheck
+cd server && npm run build
+```
+
+Piano cleanup tests:
+
+```powershell
+server/.venv/Scripts/python server/python/test_composer_mode.py
 ```
 
 ## Tech Stack
 
-- **Audio pipeline**: Python, yt-dlp, FFmpeg, Basic Pitch,
-  piano-transcription-inference, pretty_midi
-- **Frontend**: TypeScript, Vite, Web Audio API
-- **Backend**: Express, Node.js
-- **Built with**: Claude Code
+- Frontend: TypeScript, Vite, Web Audio API
+- Backend: Node.js, Express
+- Audio pipeline: Python, FFmpeg, yt-dlp, librosa, pretty_midi
+- Transcription: piano-transcription-inference, Basic Pitch
+- Source separation: Demucs
+
+## Responsible Use
+
+Only download, upload, transcribe, or redistribute audio that you own or have
+permission to use. Transforming a recording does not automatically grant
+copyright permission or prevent content claims.
 
 ## Credits
 
 Forked from [motif](https://github.com/b1rdmania/motif) by
-[@b1rdmania](https://x.com/b1rdmania), who built the Game Boy synthesis
-engine and MIDI search. This fork adds the audio-to-MIDI pipeline, the
-cleanup intelligence, and Composer Mode.
+[@b1rdmania](https://x.com/b1rdmania), who created the original concept,
+interface, MIDI search, and synthesis foundation.
 
-Non-commercial, for lols. Please don't sue anyone.
+This fork adds the audio-to-MIDI pipeline, piano transcription, automatic
+arrangement and pedal cleanup, source separation, WAV export, and the expanded
+musician-focused visualizer.
 
 ![Wario](public/wario-sprite.png)

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import math
 import os
@@ -58,6 +60,10 @@ MAJOR_PROFILE = (6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.2
 MINOR_PROFILE = (6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17)
 MAJOR_INTERVALS = {0, 2, 4, 5, 7, 9, 11}
 MINOR_INTERVALS = {0, 2, 3, 5, 7, 8, 10}
+PITCH_CLASS_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+CHORD_CORRECTION_CONFIDENCE = 0.46
+CHORD_REMOVAL_CONFIDENCE = 0.24
+HARMONY_WINDOW_SECONDS = 0.5
 
 
 def report_progress(percent: int, label: str) -> None:
@@ -243,15 +249,217 @@ def analyze_audio_timing(source: Path) -> tuple[float | None, list[float]]:
         return None, []
 
 
-def transcribe(source: Path, output: Path, mode: str, tempo_override: float | None = None) -> None:
+def find_sonic_annotator() -> str | None:
+    configured = os.environ.get("SONIC_ANNOTATOR_PATH")
+    if configured and Path(configured).is_file():
+        return configured
+
+    # Common Windows location used by the portable Sonic Annotator release.
+    portable_windows = Path("C:/Tools/sonic-annotator-win64/sonic-annotator.exe")
+    if portable_windows.is_file():
+        return str(portable_windows)
+
+    return shutil.which("sonic-annotator")
+
+
+def parse_chord_label(label: str) -> tuple[int | None, str, list[int]]:
+    """Return root, quality, and pitch classes for a Chordino-style label."""
+    normalized = label.strip().strip('"')
+    if not normalized or normalized.upper() in {"N", "X", "NO_CHORD"}:
+        return None, "none", []
+    root_text, _, suffix = normalized.partition(":")
+    # Chordino's default dictionary commonly emits compact labels such as
+    # "Am", while extended dictionaries use forms such as "A:min".
+    if not suffix and root_text.endswith("m") and len(root_text) > 1:
+        root_text = root_text[:-1]
+        suffix = "min"
+    root_text = root_text.split("/")[0].replace("b", "-")
+    try:
+        root = PITCH_CLASS_NAMES.index(root_text.replace("-", "b"))
+    except ValueError:
+        flat_names = {
+            "Db": 1, "Eb": 3, "Gb": 6, "Ab": 8, "Bb": 10,
+            "Cb": 11, "Fb": 4,
+        }
+        root = flat_names.get(root_text.replace("-", "b"))
+    if root is None:
+        return None, "unknown", []
+
+    suffix_lower = suffix.lower()
+    if "dim" in suffix_lower:
+        quality, intervals = "diminished", (0, 3, 6)
+    elif "aug" in suffix_lower:
+        quality, intervals = "augmented", (0, 4, 8)
+    elif "sus2" in suffix_lower:
+        quality, intervals = "sus2", (0, 2, 7)
+    elif "sus" in suffix_lower:
+        quality, intervals = "sus4", (0, 5, 7)
+    elif suffix_lower.startswith("min") or suffix_lower.startswith("m"):
+        quality, intervals = "minor", (0, 3, 7)
+    else:
+        quality, intervals = "major", (0, 4, 7)
+    if "7" in suffix_lower:
+        intervals = (*intervals, 10 if quality == "minor" or "7" == suffix_lower else 11)
+    return root, quality, sorted({(root + interval) % 12 for interval in intervals})
+
+
+def detect_chords_with_chordino(source: Path, duration: float) -> list[dict]:
+    """Run the real Chordino Vamp plugin through sonic-annotator."""
+    executable = find_sonic_annotator()
+    if not executable:
+        return []
+    result = subprocess.run(
+        [
+            executable,
+            "-d",
+            "vamp:nnls-chroma:chordino:simplechord",
+            "-w",
+            "csv",
+            "--csv-stdout",
+            str(source),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        print(f"Chordino skipped: {result.stderr.strip()[-300:]}", file=sys.stderr)
+        return []
+
+    rows = []
+    for row in csv.reader(io.StringIO(result.stdout)):
+        if len(row) < 3:
+            continue
+        try:
+            numeric = [float(value) for value in row[1:-1] if value.strip()]
+        except ValueError:
+            continue
+        if not numeric:
+            continue
+        start = numeric[0]
+        explicit_duration = numeric[1] if len(numeric) > 1 else None
+        root, quality, pitch_classes = parse_chord_label(row[-1])
+        rows.append({
+            "start": round(start, 3),
+            "end": round(start + explicit_duration, 3) if explicit_duration else None,
+            "label": row[-1].strip().strip('"'),
+            "root": root,
+            "quality": quality,
+            "pitch_classes": pitch_classes,
+            "confidence": 1.0,
+        })
+    for index, chord in enumerate(rows):
+        if chord["end"] is None:
+            chord["end"] = round(
+                rows[index + 1]["start"] if index + 1 < len(rows) else duration,
+                3,
+            )
+    return [chord for chord in rows if chord["end"] > chord["start"]]
+
+
+def detect_chords_with_librosa(chroma, frame_times, duration: float) -> list[dict]:
+    """Small major/minor template matcher used when Chordino is unavailable."""
+    import numpy as np
+
+    templates = []
+    for root in range(12):
+        for quality, intervals in (("major", (0, 4, 7)), ("minor", (0, 3, 7))):
+            template = np.zeros(12)
+            template[[(root + interval) % 12 for interval in intervals]] = (1.0, 0.8, 0.75)
+            templates.append((root, quality, template))
+
+    segments = []
+    for start in np.arange(0.0, duration, HARMONY_WINDOW_SECONDS):
+        end = min(duration, start + HARMONY_WINDOW_SECONDS)
+        indices = np.where((frame_times >= start) & (frame_times < end))[0]
+        if indices.size == 0:
+            continue
+        profile = np.mean(chroma[:, indices], axis=1)
+        profile_total = float(np.sum(profile))
+        if profile_total <= 1e-8:
+            continue
+        profile = profile / profile_total
+        scored = sorted(
+            (
+                cosine_similarity(profile.tolist(), template.tolist()),
+                root,
+                quality,
+            )
+            for root, quality, template in templates
+        )
+        score, root, quality = scored[-1]
+        margin = score - scored[-2][0]
+        pitch_classes = [
+            (root + interval) % 12
+            for interval in ((0, 4, 7) if quality == "major" else (0, 3, 7))
+        ]
+        segments.append({
+            "start": round(float(start), 3),
+            "end": round(float(end), 3),
+            "label": f"{PITCH_CLASS_NAMES[root]}:{'maj' if quality == 'major' else 'min'}",
+            "root": root,
+            "quality": quality,
+            "pitch_classes": pitch_classes,
+            "confidence": round(max(0.0, min(1.0, score * margin * 8)), 3),
+            "profile": [round(float(value), 4) for value in profile],
+        })
+    return segments
+
+
+def analyze_audio_harmony(source: Path) -> dict:
+    """Build a time-aligned chroma/chord map, preferring Chordino."""
+    import librosa
+    import numpy as np
+
+    audio, sample_rate = librosa.load(str(source), sr=22050, mono=True)
+    duration = len(audio) / sample_rate
+    harmonic = librosa.effects.harmonic(audio)
+    chroma = librosa.feature.chroma_cqt(y=harmonic, sr=sample_rate)
+    frame_times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sample_rate)
+    fallback = detect_chords_with_librosa(chroma, frame_times, duration)
+    chordino = detect_chords_with_chordino(source, duration)
+    segments = chordino or fallback
+
+    # Chordino labels are stronger, but keep the audio pitch profile from the
+    # fallback windows so the correction pass can compare nearby semitones.
+    for segment in segments:
+        midpoint = (segment["start"] + segment["end"]) / 2
+        profile_source = next(
+            (
+                item for item in fallback
+                if item["start"] <= midpoint < item["end"]
+            ),
+            None,
+        )
+        if profile_source:
+            segment["profile"] = profile_source["profile"]
+
+    return {
+        "chord_source": "chordino" if chordino else "librosa",
+        "segments": segments,
+        "duration": round(duration, 3),
+    }
+
+
+def transcribe(
+    source: Path,
+    output: Path,
+    mode: str,
+    tempo_override: float | None = None,
+    harmony: dict | None = None,
+) -> dict:
     if mode == "piano":
-        transcribe_piano(source, output, tempo_override)
-        return
+        return transcribe_piano(source, output, tempo_override, harmony)
 
-    transcribe_general(source, output, tempo_override)
+    return transcribe_general(source, output, tempo_override, harmony)
 
 
-def transcribe_general(source: Path, output: Path, tempo_override: float | None = None) -> None:
+def transcribe_general(
+    source: Path,
+    output: Path,
+    tempo_override: float | None = None,
+    harmony: dict | None = None,
+) -> dict:
     report_progress(35, "Loading the transcription model")
     from basic_pitch.inference import predict
 
@@ -272,11 +480,18 @@ def transcribe_general(source: Path, output: Path, tempo_override: float | None 
 
     report_progress(88, "Cleaning up the notes")
     clean_midi(midi_data, tempo_override)
+    analysis = apply_harmony_correction(midi_data, harmony, {}, tempo_override)
     output.parent.mkdir(parents=True, exist_ok=True)
     midi_data.write(str(output))
+    return analysis
 
 
-def transcribe_piano(source: Path, output: Path, tempo_override: float | None = None) -> None:
+def transcribe_piano(
+    source: Path,
+    output: Path,
+    tempo_override: float | None = None,
+    harmony: dict | None = None,
+) -> dict:
     report_progress(35, "Loading the piano model")
     import librosa
     import pretty_midi
@@ -301,8 +516,16 @@ def transcribe_piano(source: Path, output: Path, tempo_override: float | None = 
 
     report_progress(88, "Cleaning up the notes")
     midi_data = pretty_midi.PrettyMIDI(str(output))
+    confidence = extract_piano_confidence(result, transcriber)
     apply_pedal_sustain(midi_data, result.get("est_pedal_events", []))
     clean_piano_midi(midi_data, len(audio) / sample_rate)
+    repair_piano_articulation(midi_data)
+    analysis = apply_harmony_correction(
+        midi_data,
+        harmony,
+        confidence,
+        tempo_override,
+    )
     if tempo_override is not None:
         notes = [
             note
@@ -313,6 +536,277 @@ def transcribe_piano(source: Path, output: Path, tempo_override: float | None = 
         if notes:
             quantize_near_grid(midi_data, notes, tempo_override)
     midi_data.write(str(output))
+    return analysis
+
+
+def extract_piano_confidence(result: dict, transcriber) -> dict[tuple[int, int], float]:
+    """Map detected pitch/onset to a confidence derived from model outputs."""
+    try:
+        import numpy as np
+
+        output = result.get("output_dict") or {}
+        onset = np.asarray(output.get("reg_onset_output"))
+        frame = np.asarray(output.get("frame_output"))
+        if onset.ndim != 2 or frame.ndim != 2:
+            return {}
+        frames_per_second = float(getattr(transcriber, "frames_per_second", 100))
+        begin_note = int(getattr(transcriber, "begin_note", 21))
+        confidence = {}
+        for event in result.get("est_note_events", []):
+            pitch = int(event.get("midi_note", -1))
+            start = float(event.get("onset_time", -1))
+            end = float(event.get("offset_time", start))
+            pitch_index = pitch - begin_note
+            start_frame = int(round(start * frames_per_second))
+            end_frame = max(start_frame + 1, int(round(end * frames_per_second)))
+            if not (0 <= pitch_index < onset.shape[1]):
+                continue
+            onset_slice = onset[
+                max(0, start_frame - 2):min(onset.shape[0], start_frame + 3),
+                pitch_index,
+            ]
+            frame_slice = frame[
+                max(0, start_frame):min(frame.shape[0], end_frame),
+                pitch_index,
+            ]
+            onset_score = float(np.max(onset_slice)) if onset_slice.size else 0.0
+            frame_score = float(np.mean(frame_slice)) if frame_slice.size else 0.0
+            score = max(0.0, min(1.0, onset_score * 0.65 + frame_score * 0.35))
+            confidence[(pitch, round(start * 100))] = score
+        return confidence
+    except Exception as error:
+        print(f"Piano confidence extraction skipped: {error}", file=sys.stderr)
+        return {}
+
+
+def repair_piano_articulation(midi_data) -> None:
+    """Repair clipped phrases without smearing fast repeated piano notes."""
+    for instrument in midi_data.instruments:
+        if instrument.is_drum or not instrument.notes:
+            continue
+        notes = sorted(instrument.notes, key=lambda note: (note.start, note.pitch))
+        onset_times = sorted({round(note.start, 4) for note in notes})
+        gaps = [
+            later - earlier
+            for earlier, later in zip(onset_times, onset_times[1:])
+            if 0.025 <= later - earlier <= 0.8
+        ]
+        pulse = statistics.median(gaps) if gaps else 0.25
+        by_pitch = {}
+        for note in notes:
+            by_pitch.setdefault(note.pitch, []).append(note)
+
+        for pitch_notes in by_pitch.values():
+            pitch_notes.sort(key=lambda note: note.start)
+            for index, note in enumerate(pitch_notes):
+                next_same = (
+                    pitch_notes[index + 1].start
+                    if index + 1 < len(pitch_notes)
+                    else float("inf")
+                )
+                next_onset = next(
+                    (time for time in onset_times if time > note.start + 0.015),
+                    None,
+                )
+                if next_onset is None:
+                    continue
+                gap = next_onset - note.end
+                hand_scale = 0.55 if note.pitch < 60 else 0.9
+                phrase_limit = min(0.22, pulse * hand_scale)
+                if 0 < gap <= phrase_limit and next_same - note.end > 0.045:
+                    note.end = min(next_onset - 0.006, next_same - 0.012)
+
+        # Automatic complexity control: in rapid passages, keep attacks and
+        # strong outer voices but shorten quiet inner tails first.
+        for onset in onset_times:
+            active = [
+                note for note in notes
+                if note.start < onset - 0.02 and note.end > onset
+            ]
+            new_notes = [note for note in notes if abs(note.start - onset) <= 0.025]
+            density_limit = 5 if pulse < 0.11 else 7 if pulse < 0.18 else 9
+            overflow = len(active) + len(new_notes) - density_limit
+            if overflow <= 0:
+                continue
+            ranked = sorted(
+                active,
+                key=lambda note: (
+                    note.pitch >= 72,
+                    note.pitch <= 48,
+                    note.velocity,
+                    note.end - note.start,
+                ),
+            )
+            for note in ranked[:overflow]:
+                note.end = max(note.start + 0.055, onset - 0.007)
+
+
+def chord_at_time(harmony: dict | None, time: float) -> dict | None:
+    if not harmony:
+        return None
+    return next(
+        (
+            segment for segment in harmony.get("segments", [])
+            if segment.get("start", 0) <= time < segment.get("end", 0)
+        ),
+        None,
+    )
+
+
+def analyze_with_music21(midi_data, tempo: float) -> dict:
+    """Use music21 for a second symbolic opinion; fail open if unavailable."""
+    try:
+        from music21 import chord as m21_chord
+        from music21 import note as m21_note
+        from music21 import stream
+
+        score = stream.Stream()
+        seconds_per_quarter = 60.0 / max(1.0, tempo)
+        for instrument in midi_data.instruments:
+            if instrument.is_drum:
+                continue
+            part = stream.Part()
+            for midi_note in instrument.notes:
+                value = m21_note.Note(midi_note.pitch)
+                value.offset = midi_note.start / seconds_per_quarter
+                value.quarterLength = max(
+                    0.0625,
+                    (midi_note.end - midi_note.start) / seconds_per_quarter,
+                )
+                part.insert(value.offset, value)
+            score.insert(0, part)
+        detected_key = score.analyze("key")
+        chordified = score.chordify()
+        chord_count = sum(
+            1 for value in chordified.recurse().getElementsByClass(m21_chord.Chord)
+            if len(value.pitchClasses) >= 2
+        )
+        return {
+            "key": f"{detected_key.tonic.name} {detected_key.mode}",
+            "key_confidence": round(float(detected_key.correlationCoefficient or 0), 3),
+            "symbolic_chords": chord_count,
+            "available": True,
+        }
+    except Exception as error:
+        print(f"music21 analysis skipped: {error}", file=sys.stderr)
+        return {"available": False}
+
+
+def apply_harmony_correction(
+    midi_data,
+    harmony: dict | None,
+    confidence_map: dict[tuple[int, int], float],
+    tempo_override: float | None,
+) -> dict:
+    """Conservatively combine model confidence, audio chords, and music21."""
+    notes = sorted(
+        (
+            note
+            for instrument in midi_data.instruments
+            if not instrument.is_drum
+            for note in instrument.notes
+        ),
+        key=lambda note: (note.start, note.pitch),
+    )
+    if not notes:
+        return {"summary": {"kept": 0, "corrected": 0, "removed": 0}}
+
+    tempo = tempo_override if tempo_override is not None else estimate_tempo(midi_data, notes)
+    key_guess = infer_key(notes)
+    scale = None
+    fallback_key = None
+    if key_guess:
+        tonic, mode, _ = key_guess
+        intervals = MAJOR_INTERVALS if mode == "major" else MINOR_INTERVALS
+        scale = {(tonic + interval) % 12 for interval in intervals}
+        fallback_key = f"{PITCH_CLASS_NAMES[tonic]} {mode}"
+    symbolic = analyze_with_music21(midi_data, tempo)
+
+    velocities = [note.velocity for note in notes]
+    median_velocity = statistics.median(velocities)
+    diagnostics = []
+    removed_ids = set()
+    for note in notes:
+        original_pitch = note.pitch
+        confidence = confidence_map.get(
+            (note.pitch, round(note.start * 100)),
+            min(0.92, max(0.35, note.velocity / max(1, median_velocity) * 0.58)),
+        )
+        chord = chord_at_time(harmony, note.start)
+        chord_pcs = set(chord.get("pitch_classes", [])) if chord else set()
+        profile = chord.get("profile", []) if chord else []
+        duration = note.end - note.start
+        in_chord = not chord_pcs or note.pitch % 12 in chord_pcs
+        in_scale = scale is None or note.pitch % 12 in scale
+        weak = confidence < CHORD_CORRECTION_CONFIDENCE
+        short = duration <= 0.18
+        status = "kept"
+        reason = ""
+
+        if weak and not in_chord and not in_scale:
+            candidates = [
+                pitch for pitch in (note.pitch - 1, note.pitch + 1)
+                if MIN_MIDI_NOTE <= pitch <= MAX_MIDI_NOTE
+                and (not chord_pcs or pitch % 12 in chord_pcs)
+                and (scale is None or pitch % 12 in scale)
+            ]
+            original_strength = profile[note.pitch % 12] if len(profile) == 12 else 0.0
+            supported = [
+                pitch for pitch in candidates
+                if len(profile) != 12
+                or profile[pitch % 12] >= original_strength + 0.025
+            ]
+            if supported:
+                nearby = [
+                    other.pitch for other in notes
+                    if other is not note and abs(other.start - note.start) <= 0.3
+                ]
+                note.pitch = min(
+                    supported,
+                    key=lambda pitch: sum(abs(pitch - value) for value in nearby) if nearby else abs(pitch - original_pitch),
+                )
+                status = "corrected"
+                reason = "weak note disagreed with both audio chord and detected key"
+            elif confidence < CHORD_REMOVAL_CONFIDENCE and short:
+                removed_ids.add(id(note))
+                status = "removed"
+                reason = "very weak short note conflicted with chord and key"
+            else:
+                status = "conflict"
+                reason = "chromatic note preserved because evidence was not strong enough"
+
+        if status != "kept":
+            diagnostics.append({
+                "time": round(note.start, 3),
+                "duration": round(duration, 3),
+                "pitch": note.pitch,
+                "original_pitch": original_pitch,
+                "confidence": round(confidence, 3),
+                "status": status,
+                "reason": reason,
+                "chord": chord.get("label") if chord else None,
+            })
+
+    if removed_ids:
+        for instrument in midi_data.instruments:
+            instrument.notes = [
+                note for note in instrument.notes if id(note) not in removed_ids
+            ]
+
+    summary = {
+        "kept": len(notes) - len(diagnostics),
+        "corrected": sum(item["status"] == "corrected" for item in diagnostics),
+        "removed": sum(item["status"] == "removed" for item in diagnostics),
+        "conflicts_preserved": sum(item["status"] == "conflict" for item in diagnostics),
+    }
+    return {
+        "chord_source": harmony.get("chord_source") if harmony else "none",
+        "key": symbolic.get("key") or fallback_key,
+        "music21": symbolic,
+        "summary": summary,
+        "events": diagnostics[:1200],
+        "chords": (harmony.get("segments", []) if harmony else [])[:600],
+    }
 
 
 def apply_pedal_sustain(midi_data, pedal_events) -> None:
@@ -328,6 +822,14 @@ def apply_pedal_sustain(midi_data, pedal_events) -> None:
         return
 
     for instrument in midi_data.instruments:
+        onset_times = sorted({round(note.start, 3) for note in instrument.notes})
+        onset_gaps = [
+            later - earlier
+            for earlier, later in zip(onset_times, onset_times[1:])
+            if 0.02 <= later - earlier <= 0.6
+        ]
+        median_gap = statistics.median(onset_gaps) if onset_gaps else 0.25
+        passage_cap = 0.24 if median_gap < 0.1 else 0.36 if median_gap < 0.18 else 0.55
         by_pitch = {}
         for note in instrument.notes:
             by_pitch.setdefault(note.pitch, []).append(note)
@@ -342,7 +844,18 @@ def apply_pedal_sustain(midi_data, pedal_events) -> None:
                 )
                 for pedal_start, pedal_end in pedal_ranges:
                     if pedal_start <= note.end <= pedal_end:
-                        note.end = min(pedal_end, next_start, note.end + 1.5)
+                        register_cap = (
+                            passage_cap * 0.7
+                            if note.pitch < 52
+                            else passage_cap * 1.2
+                            if note.pitch >= 72
+                            else passage_cap
+                        )
+                        note.end = min(
+                            pedal_end,
+                            next_start,
+                            note.end + register_cap,
+                        )
                         break
 
 
@@ -360,6 +873,47 @@ def clean_piano_midi(midi_data, audio_duration: float) -> None:
             )
         ]
         instrument.notes.sort(key=lambda note: (note.start, note.pitch, note.end))
+        reduce_piano_pedal_buildup(instrument.notes)
+
+
+def reduce_piano_pedal_buildup(notes) -> None:
+    """Thin weak pedal tails when later attacks make the passage overcrowded."""
+    if len(notes) < 4:
+        return
+
+    onset_groups = []
+    for note in sorted(notes, key=lambda item: (item.start, item.pitch)):
+        if onset_groups and note.start - onset_groups[-1][0].start <= 0.025:
+            onset_groups[-1].append(note)
+        else:
+            onset_groups.append([note])
+
+    median_velocity = statistics.median(note.velocity for note in notes)
+    for group in onset_groups:
+        onset = group[0].start
+        active = [
+            note
+            for note in notes
+            if note.start < onset - 0.025 and note.end > onset
+        ]
+        allowed_tails = 3 if len(group) >= 4 else 4
+        if len(active) <= allowed_tails:
+            continue
+
+        # Keep high melodic sustains and stronger notes. Quiet low/mid pedal
+        # residue is shortened first because it masks new harmony most.
+        ranked = sorted(
+            active,
+            key=lambda note: (
+                note.pitch >= 72,
+                note.velocity >= median_velocity,
+                note.velocity,
+                note.pitch,
+            ),
+            reverse=True,
+        )
+        for note in ranked[allowed_tails:]:
+            note.end = max(note.start + 0.06, onset - 0.008)
 
 
 def clean_midi(midi_data, tempo_override: float | None = None) -> None:
@@ -1290,6 +1844,12 @@ def run_pipeline(args) -> None:
         convert_to_wav(source, normalized, ffmpeg_path)
         report_progress(30, "Analyzing tempo and sections")
         detected_tempo, sections = analyze_audio_timing(normalized)
+        report_progress(32, "Analyzing chords and harmony")
+        try:
+            harmony = analyze_audio_harmony(normalized)
+        except Exception as error:
+            print(f"Harmony analysis skipped: {error}", file=sys.stderr)
+            harmony = {"chord_source": "none", "segments": []}
         tempo = args.bpm
         bpm_source = "manual" if tempo is not None else None
         if tempo is None and detected_tempo is not None:
@@ -1297,9 +1857,19 @@ def run_pipeline(args) -> None:
             bpm_source = "detected"
         if args.separate:
             transcribe_with_stems(normalized, args.output.resolve(), work_dir, tempo)
+            import pretty_midi
+            stem_midi = pretty_midi.PrettyMIDI(str(args.output.resolve()))
+            analysis = apply_harmony_correction(stem_midi, harmony, {}, tempo)
+            stem_midi.write(str(args.output.resolve()))
             arrangement_value = "stems"
         else:
-            transcribe(normalized, args.output.resolve(), args.mode, tempo)
+            analysis = transcribe(
+                normalized,
+                args.output.resolve(),
+                args.mode,
+                tempo,
+                harmony,
+            )
             arranged = False
             if args.arrange in {"composer", "expanded"}:
                 label = (
@@ -1326,6 +1896,7 @@ def run_pipeline(args) -> None:
                         "bpm": tempo,
                         "bpm_source": bpm_source,
                         "sections": sections,
+                        "analysis": analysis,
                     },
                     ensure_ascii=True,
                 ),

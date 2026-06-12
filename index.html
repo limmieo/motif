@@ -928,12 +928,23 @@
         /* Piano-roll visualizer (generated block) */
         .piano-roll {
             width: 100%;
-            height: 160px;
+            height: 220px;
             margin-top: 14px;
             border: 2px solid var(--gb-light);
             background: var(--gb-darkest);
             image-rendering: pixelated;
             display: block;
+        }
+        .live-notes {
+            margin-top: 6px;
+            min-height: 24px;
+            padding: 8px 10px;
+            border: 1px solid var(--gb-light);
+            background: var(--gb-darkest);
+            color: var(--gb-lightest);
+            font-size: 0.72em;
+            line-height: 1.6;
+            text-align: left;
         }
 
         /* iOS audio unlock (Motif) */
@@ -1159,35 +1170,6 @@
             font-size: 7px;
             color: var(--gb-dark);
         }
-        .arrangement-setting {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            flex-wrap: wrap;
-            margin-top: 10px;
-            color: var(--gb-darkest);
-        }
-        .arrangement-setting label {
-            font-size: 8px;
-        }
-        .arrangement-setting select {
-            flex: 1;
-            min-width: 240px;
-            background: var(--gb-lightest);
-            color: var(--gb-darkest);
-            border: 2px solid var(--gb-dark);
-            padding: 8px 10px;
-            font-family: 'Press Start 2P', monospace;
-            font-size: 8px;
-        }
-        .arrangement-help {
-            width: 100%;
-            margin: 0;
-            color: var(--gb-dark);
-            font-size: 8px;
-            line-height: 1.7;
-        }
-
         .audio-import {
             margin-top: calc(var(--spacing-unit) * 2);
             padding: calc(var(--spacing-unit) * 2);
@@ -1347,30 +1329,12 @@
             </div>
             <div class="lightweight-setting">
                 <label>
-                    <input id="lightweightMode" type="checkbox" />
-                    Lightweight Mode
-                    <span>(optional: cleaner, max 3 notes)</span>
-                </label>
-            </div>
-            <div class="lightweight-setting">
-                <label>
                     <input id="separateStems" type="checkbox" />
                     Separate instruments first
                     <span>(best for full songs with vocals/drums — slower, one-time model download)</span>
                 </label>
             </div>
-            <div class="arrangement-setting">
-                <label for="transcriptionArrangement">How should it simplify the song?</label>
-                <select id="transcriptionArrangement">
-                    <option value="off" selected>Closest to the original song</option>
-                    <option value="expanded">Fuller Game Boy remix</option>
-                    <option value="composer">Simple retro remix</option>
-                </select>
-                <p id="arrangementHelp" class="arrangement-help">
-                    Keeps every note the computer can hear. Start here for the most accurate result.
-                </p>
-            </div>
-            <p class="audio-import-note">BPM is optional. Enter a known song speed to tighten timing, or leave it blank for automatic timing. Not sure? Choose "Closest to the original song."</p>
+            <p class="audio-import-note">The faithful conversion automatically separates piano hands, controls pedal buildup, and simplifies only overloaded moments. BPM is optional.</p>
             <div
                 id="transcriptionProgress"
                 class="transcription-progress"
@@ -1460,17 +1424,9 @@
                     </div>
 
                     <canvas id="pianoRoll" class="piano-roll" style="display:none;" aria-label="Piano roll visualization of the playing voices"></canvas>
+                    <div id="liveNotes" class="live-notes" style="display:none;" aria-live="polite"></div>
 
                     <div id="voiceMixer" class="voice-mixer" style="display:none;"></div>
-
-                    <div class="section-loop">
-                        <label for="styleSelect">Style</label>
-                        <select id="styleSelect">
-                            <option value="normal" selected>Normal</option>
-                            <option value="spooky">Spooky (minor key, slower)</option>
-                            <option value="dance">Dance (faster, drums)</option>
-                        </select>
-                    </div>
 
                     <div id="sectionLoopRow" class="section-loop" style="display:none;">
                         <label for="sectionLoopSelect">Loop</label>
@@ -1563,8 +1519,8 @@
                         <p style="margin-top: 8px;"><a href="https://github.com/b1rdmania/motif" target="_blank" rel="noopener noreferrer">View the original Wario Synth repository</a></p>
                     </div>
                     <div class="faq-item">
-                        <h4>Lightweight Mode</h4>
-                        <p>Lightweight Mode keeps arrangements readable during busy piano passages: clean note handoffs, three notes maximum, a locked top melody, one light harmony voice, and output compression.</p>
+                        <h4>Automatic piano cleanup</h4>
+                        <p>Fast and crowded passages are cleaned automatically. The converter follows left and right hands, limits pedal buildup, protects melody and bass, and removes only redundant notes when the texture becomes overloaded.</p>
                     </div>
                 </div>
             </main>

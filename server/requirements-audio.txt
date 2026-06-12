@@ -6,5 +6,11 @@ yt-dlp[default]>=2026.6.9
 torch
 torchaudio
 piano-transcription-inference
+# Symbolic key, chord, and voice-leading analysis. Chordino itself is a
+# native Vamp plugin used through sonic-annotator when installed; the app
+# falls back to librosa chroma automatically when it is unavailable.
+music21>=9,<10
+more-itertools>=8.6
+webcolors>=1.5
 # Source separation (vocals / drums / bass / other) before transcription.
 demucs

@@ -3,10 +3,13 @@
 import pretty_midi
 
 from audio_to_midi import (
+    apply_pedal_sustain,
+    apply_harmony_correction,
     arrange_for_game_boy,
     choose_smooth_harmony_pair,
     is_dense_polyphony,
     quantize_near_grid,
+    reduce_piano_pedal_buildup,
 )
 
 
@@ -245,6 +248,98 @@ def test_same_pitch_restrike_does_not_crash_expanded_mode():
     print("ok: same-pitch re-strike handled in expanded mode")
 
 
+def test_fast_piano_pedal_is_capped():
+    notes = [
+        make_note(48 + index % 12, index * 0.06, index * 0.06 + 0.05, velocity=70)
+        for index in range(16)
+    ]
+    midi = make_midi(notes)
+    apply_pedal_sustain(
+        midi,
+        [{"onset_time": 0.0, "offset_time": 2.0}],
+    )
+    extensions = [note.end - (note.start + 0.05) for note in notes[:-1]]
+    assert max(extensions) <= 0.24 + 1e-9, max(extensions)
+    print("ok: fast piano pedal tails are capped")
+
+
+def test_pedal_buildup_keeps_only_strong_sustains():
+    notes = [
+        make_note(36 + index * 5, 0.0, 1.2, velocity=45 + index * 5)
+        for index in range(7)
+    ]
+    notes.extend([
+        make_note(72, 0.5, 0.7, velocity=100),
+        make_note(76, 0.5, 0.7, velocity=95),
+        make_note(79, 0.5, 0.7, velocity=90),
+        make_note(84, 0.5, 0.7, velocity=85),
+    ])
+    reduce_piano_pedal_buildup(notes)
+    tails = [note for note in notes[:7] if note.end > 0.5]
+    assert len(tails) <= 3, len(tails)
+    assert max(note.velocity for note in tails) >= 70
+    print("ok: crowded pedal tails keep the strongest sustains")
+
+
+def test_weak_harmony_conflict_moves_one_semitone():
+    notes = [
+        make_note(60, 0.0, 0.5, velocity=90),
+        make_note(64, 0.0, 0.5, velocity=90),
+        make_note(66, 0.0, 0.12, velocity=30),
+        make_note(67, 0.5, 1.0, velocity=90),
+    ]
+    midi = make_midi(notes)
+    harmony = {
+        "chord_source": "librosa",
+        "segments": [{
+            "start": 0.0,
+            "end": 1.0,
+            "label": "C:maj",
+            "pitch_classes": [0, 4, 7],
+            "profile": [0.4, 0, 0, 0, 0.3, 0, 0.01, 0.29, 0, 0, 0, 0],
+        }],
+    }
+    analysis = apply_harmony_correction(
+        midi,
+        harmony,
+        {(66, 0): 0.2},
+        120,
+    )
+    assert notes[2].pitch == 67
+    assert analysis["summary"]["corrected"] == 1
+    print("ok: weak semitone conflict corrected using chord and chroma")
+
+
+def test_confident_chromatic_note_is_preserved():
+    chromatic = make_note(66, 0.0, 0.5, velocity=110)
+    midi = make_midi([
+        make_note(60, 0.0, 0.5, velocity=90),
+        make_note(64, 0.0, 0.5, velocity=90),
+        chromatic,
+        make_note(67, 0.5, 1.0, velocity=90),
+    ])
+    harmony = {
+        "chord_source": "librosa",
+        "segments": [{
+            "start": 0.0,
+            "end": 1.0,
+            "label": "C:maj",
+            "pitch_classes": [0, 4, 7],
+            "profile": [0.4, 0, 0, 0, 0.3, 0, 0.01, 0.29, 0, 0, 0, 0],
+        }],
+    }
+    analysis = apply_harmony_correction(
+        midi,
+        harmony,
+        {(66, 0): 0.9},
+        120,
+    )
+    assert chromatic.pitch == 66
+    assert analysis["summary"]["corrected"] == 0
+    assert analysis["summary"]["removed"] == 0
+    print("ok: confident chromatic note preserved")
+
+
 if __name__ == "__main__":
     test_monophonic_input_is_untouched()
     test_dense_chords_become_three_voices()
@@ -257,4 +352,8 @@ if __name__ == "__main__":
     test_harmony_voice_leading_prefers_common_tones()
     test_known_bpm_gently_aligns_note_timing()
     test_same_pitch_restrike_does_not_crash_expanded_mode()
+    test_fast_piano_pedal_is_capped()
+    test_pedal_buildup_keeps_only_strong_sustains()
+    test_weak_harmony_conflict_moves_one_semitone()
+    test_confident_chromatic_note_is_preserved()
     print("all composer mode checks passed")

@@ -1,5 +1,4 @@
 import { MotifEngine } from './core/MotifEngine';
-import { applyStyle, styleTimeScale, type StylePreset } from './core/StyleTransformer';
 import { MIDIService, type AudioTranscriptionProgress } from './services/MIDIService';
 import { MIDIParser } from './midi/MIDIParser';
 import { SoundfontMIDIPlayer } from './synthesis/SoundfontMIDIPlayer';
@@ -18,19 +17,18 @@ class MotifApp {
   private songInput!: HTMLInputElement;
   private audioUrlInput!: HTMLInputElement;
   private transcriptionMode!: HTMLSelectElement;
-  private transcriptionArrangement!: HTMLSelectElement;
   private transcriptionBpm!: HTMLInputElement;
   private separateStems!: HTMLInputElement;
-  private arrangementHelp!: HTMLElement;
   private voiceMixer!: HTMLElement;
   private sectionLoopRow!: HTMLElement;
   private sectionLoopSelect!: HTMLSelectElement;
   private downloadMidiBtn!: HTMLButtonElement;
   private downloadWavBtn!: HTMLButtonElement;
   private pianoRoll!: HTMLCanvasElement;
+  private liveNotes!: HTMLElement;
   private pianoRollFrame: number | null = null;
   private pianoRollRange: { min: number; max: number } | null = null;
-  private styleSelect!: HTMLSelectElement;
+  private inspectedRollNote: { role: string; event: NoteEvent } | null = null;
   private transcribeUrlBtn!: HTMLButtonElement;
   private audioFileInput!: HTMLInputElement;
   private chooseAudioBtn!: HTMLButtonElement;
@@ -65,7 +63,6 @@ class MotifApp {
 
   // Motif controls
   private motifBtn!: HTMLButtonElement;
-  private lightweightMode!: HTMLInputElement;
   private motifProgressContainer!: HTMLElement;
   private motifProgressBar!: HTMLInputElement;
   private motifProgressFill!: HTMLElement;
@@ -130,17 +127,15 @@ class MotifApp {
     this.songInput = document.getElementById('songInput') as HTMLInputElement;
     this.audioUrlInput = document.getElementById('audioUrlInput') as HTMLInputElement;
     this.transcriptionMode = document.getElementById('transcriptionMode') as HTMLSelectElement;
-    this.transcriptionArrangement = document.getElementById('transcriptionArrangement') as HTMLSelectElement;
     this.transcriptionBpm = document.getElementById('transcriptionBpm') as HTMLInputElement;
     this.separateStems = document.getElementById('separateStems') as HTMLInputElement;
-    this.arrangementHelp = document.getElementById('arrangementHelp')!;
     this.voiceMixer = document.getElementById('voiceMixer')!;
     this.sectionLoopRow = document.getElementById('sectionLoopRow')!;
     this.sectionLoopSelect = document.getElementById('sectionLoopSelect') as HTMLSelectElement;
     this.downloadMidiBtn = document.getElementById('downloadMidiBtn') as HTMLButtonElement;
     this.downloadWavBtn = document.getElementById('downloadWavBtn') as HTMLButtonElement;
     this.pianoRoll = document.getElementById('pianoRoll') as HTMLCanvasElement;
-    this.styleSelect = document.getElementById('styleSelect') as HTMLSelectElement;
+    this.liveNotes = document.getElementById('liveNotes')!;
     this.transcribeUrlBtn = document.getElementById('transcribeUrlBtn') as HTMLButtonElement;
     this.audioFileInput = document.getElementById('audioFileInput') as HTMLInputElement;
     this.chooseAudioBtn = document.getElementById('chooseAudioBtn') as HTMLButtonElement;
@@ -167,7 +162,6 @@ class MotifApp {
 
     // Motif controls
     this.motifBtn = document.getElementById('motifBtn') as HTMLButtonElement;
-    this.lightweightMode = document.getElementById('lightweightMode') as HTMLInputElement;
     this.motifProgressContainer = document.getElementById('motifProgressContainer')!;
     this.motifProgressBar = document.getElementById('motifProgressBar') as HTMLInputElement;
     this.motifProgressFill = document.getElementById('motifProgressFill')!;
@@ -239,6 +233,13 @@ class MotifApp {
     };
     this.motifProgressBar.addEventListener('input', seekHandler);
     this.motifProgressBar.addEventListener('change', seekHandler);
+    this.pianoRoll.addEventListener('mousemove', event => this.handlePianoRollHover(event));
+    this.pianoRoll.addEventListener('mouseleave', () => {
+      if (!this.inspectedRollNote) return;
+      this.inspectedRollNote = null;
+      this.pianoRoll.style.cursor = 'default';
+      this.drawPianoRoll();
+    });
 
     this.copyLinkBtn.addEventListener('click', () => void this.handleCopyLink());
     this.shareToXBtn.addEventListener('click', () => void this.handleShareToX());
@@ -247,7 +248,6 @@ class MotifApp {
     this.downloadMidiBtn.addEventListener('click', () => this.handleDownloadMidi());
     this.downloadWavBtn.addEventListener('click', () => void this.handleDownloadWav());
     this.sectionLoopSelect.addEventListener('change', () => this.handleSectionLoopChange());
-    this.styleSelect.addEventListener('change', () => void this.handleStyleChange());
 
     // Embed snippet copy (may be disabled / not-live)
     this.copyEmbedBtn?.addEventListener('click', () => void this.copyEmbedSnippet());
@@ -264,8 +264,6 @@ class MotifApp {
     this.faqBackdrop.addEventListener('click', (e) => {
       if (e.target === this.faqBackdrop) this.closeFaq();
     });
-    this.transcriptionArrangement.addEventListener('change', () => this.updateArrangementHelp());
-    this.updateArrangementHelp();
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') this.closeFaq();
     });
@@ -281,7 +279,7 @@ class MotifApp {
       onProgress => this.midiService.transcribeYouTube(
         url,
         this.getTranscriptionMode(),
-        this.getTranscriptionArrangement(),
+        'off',
         this.getTranscriptionBpm(),
         this.separateStems.checked,
         onProgress
@@ -295,7 +293,7 @@ class MotifApp {
       onProgress => this.midiService.transcribeAudioFile(
         file,
         this.getTranscriptionMode(),
-        this.getTranscriptionArrangement(),
+        'off',
         this.getTranscriptionBpm(),
         this.separateStems.checked,
         onProgress
@@ -309,12 +307,6 @@ class MotifApp {
     return this.transcriptionMode.value === 'general' ? 'general' : 'piano';
   }
 
-  private getTranscriptionArrangement(): 'off' | 'composer' | 'expanded' {
-    if (this.transcriptionArrangement.value === 'expanded') return 'expanded';
-    if (this.transcriptionArrangement.value === 'composer') return 'composer';
-    return 'off';
-  }
-
   private getTranscriptionBpm(): number | undefined {
     const value = this.transcriptionBpm.value.trim();
     if (!value) return undefined;
@@ -323,15 +315,6 @@ class MotifApp {
       throw new Error('Song speed must be between 40 and 240 BPM.');
     }
     return bpm;
-  }
-
-  private updateArrangementHelp(): void {
-    const arrangement = this.getTranscriptionArrangement();
-    this.arrangementHelp.textContent = arrangement === 'expanded'
-      ? 'Keeps the main tune, bass, and two smoother background parts. It follows nearby chords to avoid awkward note jumps.'
-      : arrangement === 'composer'
-        ? 'Keeps only the most important parts. This sounds more retro, but it may leave out notes from the song.'
-        : 'Keeps every note the computer can hear. Start here for the most accurate result.';
   }
 
   private async runTranscription(
@@ -344,6 +327,7 @@ class MotifApp {
       bpm?: number;
       bpmSource?: string;
       sections?: number[];
+      analysis?: import('./services/MIDIService').AudioTranscriptionResult['analysis'];
     }>,
     fallbackTitle: string
   ): Promise<void> {
@@ -375,6 +359,7 @@ class MotifApp {
           bpm: transcription.bpm,
           bpmSource: transcription.bpmSource,
           sections: transcription.sections,
+          analysis: transcription.analysis,
         },
         buffer: midiBuffer,
       };
@@ -383,17 +368,20 @@ class MotifApp {
       this.selectedTitle.textContent = this.cleanSongTitle(title);
       const arrangementLabel = transcription.arrangement === 'stems'
         ? 'Audio converted with separated instruments (melody / harmony / bass / drums)'
-        : transcription.arrangement === 'expanded'
-          ? 'Audio converted with the Fuller Game Boy remix setting'
-          : transcription.arrangement === 'composer'
-            ? 'Audio converted with the Simple retro remix setting'
-            : 'Audio converted with the Closest to the original song setting';
+        : 'Audio converted with automatic faithful piano cleanup';
       const bpmLabel = transcription.bpm === undefined
         ? ''
         : ` | Timing: ${transcription.bpm} BPM (${
           transcription.bpmSource === 'manual' ? 'entered' : 'auto-detected'
         })`;
-      this.selectedMeta.textContent = arrangementLabel + bpmLabel;
+      const analysis = transcription.analysis;
+      const summary = analysis?.summary;
+      const harmonyLabel = analysis
+        ? ` | Harmony: ${analysis.key ?? 'unknown key'} via ${
+          analysis.chord_source === 'chordino' ? 'Chordino' : analysis.chord_source ?? 'audio chroma'
+        } | ${summary?.corrected ?? 0} corrected, ${summary?.removed ?? 0} removed`
+        : '';
+      this.selectedMeta.textContent = arrangementLabel + bpmLabel + harmonyLabel;
       this.enablePlayerControls();
       this.copyLinkBtn.disabled = true;
       this.updateIOSAudioBanner();
@@ -753,18 +741,10 @@ class MotifApp {
         | 'composer'
         | 'expanded'
         | undefined;
-      const styledEvents = applyStyle(
-        this.currentMIDI.events,
-        this.getStylePreset(),
-        this.currentMIDI.metadata?.bpm
-      );
       await this.motifEngine.generateFromMIDI(
-        styledEvents,
-        arrangementMode === 'original' && !this.lightweightMode.checked
-          ? 'passthrough'
-          : 'procedural',
+        this.currentMIDI.events,
+        'procedural',
         {
-          lightweightMode: this.lightweightMode.checked,
           arrangementMode,
         }
       );
@@ -842,6 +822,7 @@ class MotifApp {
       .flatMap(voice => voice.events.map(event => event.pitch));
     if (pitches.length === 0) {
       this.pianoRoll.style.display = 'none';
+      this.liveNotes.style.display = 'none';
       this.pianoRollRange = null;
       return;
     }
@@ -850,6 +831,7 @@ class MotifApp {
       max: Math.max(...pitches) + 2,
     };
     this.pianoRoll.style.display = 'block';
+    this.liveNotes.style.display = 'block';
     this.drawPianoRoll();
   }
 
@@ -896,16 +878,21 @@ class MotifApp {
       : this.motifResumeProgress * this.motifEngine.getDuration();
     const windowStart = now - 2;
     const windowSpan = 8;
+    const analysis = this.currentMIDI?.metadata?.analysis as
+      | import('./services/MIDIService').AudioTranscriptionResult['analysis']
+      | undefined;
 
     ctx.fillStyle = '#0f380f';
     ctx.fillRect(0, 0, width, height);
+    const labelWidth = 42;
+    const chartWidth = Math.max(1, width - labelWidth);
 
     // One faint gridline per second.
     ctx.strokeStyle = 'rgba(139, 172, 15, 0.16)';
     ctx.lineWidth = 1;
     for (let second = Math.ceil(windowStart); second <= windowStart + windowSpan; second++) {
       if (second < 0) continue;
-      const x = ((second - windowStart) / windowSpan) * width;
+      const x = labelWidth + ((second - windowStart) / windowSpan) * chartWidth;
       ctx.beginPath();
       ctx.moveTo(x, 0);
       ctx.lineTo(x, height);
@@ -916,17 +903,44 @@ class MotifApp {
     const pitchedHeight = height - drumLaneHeight - 4;
     const laneCount = Math.max(1, range.max - range.min);
     const laneHeight = pitchedHeight / laneCount;
+    ctx.font = '8px "Press Start 2P", monospace';
+    ctx.textBaseline = 'middle';
 
+    // Pitch guides and octave labels let musicians orient themselves quickly.
+    for (let pitch = Math.ceil(range.min); pitch <= Math.floor(range.max); pitch++) {
+      if (pitch % 12 !== 0) continue;
+      const y = ((range.max - pitch) / laneCount) * pitchedHeight + 2;
+      ctx.strokeStyle = 'rgba(139, 172, 15, 0.2)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(labelWidth, y);
+      ctx.lineTo(width, y);
+      ctx.stroke();
+      ctx.fillStyle = '#8bac0f';
+      ctx.fillText(MotifApp.noteName(pitch), 3, y);
+    }
+
+    const activeNotes: Array<{ role: string; pitch: number; velocity: number }> = [];
     for (const voice of voices) {
       const isDrums = voice.role === 'percussion';
       const baseColor = MotifApp.ROLL_COLORS[voice.role] ?? '#8bac0f';
       for (const event of voice.events) {
         if (event.time >= windowStart + windowSpan) break;
         if (event.time + event.duration <= windowStart) continue;
-        const x = ((event.time - windowStart) / windowSpan) * width;
-        const noteWidth = Math.max(2, (event.duration / windowSpan) * width - 1);
+        const x = labelWidth + ((event.time - windowStart) / windowSpan) * chartWidth;
+        const noteWidth = Math.max(2, (event.duration / windowSpan) * chartWidth - 1);
         const active = now >= event.time && now <= event.time + event.duration;
-        ctx.fillStyle = active ? '#e0f8d0' : baseColor;
+        const inspected = this.inspectedRollNote?.role === voice.role
+          && this.inspectedRollNote.event === event;
+        const diagnostic = analysis?.events?.find(item =>
+          item.status !== 'removed'
+          && Math.abs(item.time - event.time) <= 0.06
+          && Math.abs(item.pitch - event.pitch) <= 1
+        );
+        ctx.fillStyle = inspected || active ? '#e0f8d0' : baseColor;
+        if (active && !isDrums) {
+          activeNotes.push({ role: voice.role, pitch: event.pitch, velocity: event.velocity });
+        }
         if (isDrums) {
           // Three thin lanes at the bottom: hats, snares, kicks (top to bottom).
           const lane = event.pitch <= 36 ? 2 : event.pitch <= 40 ? 1 : 0;
@@ -936,18 +950,144 @@ class MotifApp {
         } else {
           const y = ((range.max - event.pitch) / laneCount) * pitchedHeight + 2;
           ctx.fillRect(x, y, noteWidth, Math.max(2, laneHeight - 1));
+          if (diagnostic?.status === 'corrected') {
+            ctx.strokeStyle = '#e0f8d0';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([3, 2]);
+            ctx.strokeRect(x, y, noteWidth, Math.max(2, laneHeight - 1));
+            ctx.setLineDash([]);
+          } else if (diagnostic?.status === 'conflict') {
+            ctx.strokeStyle = '#8bac0f';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(x, y, noteWidth, Math.max(2, laneHeight - 1));
+          }
+          if (inspected) {
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x - 1, y - 1, noteWidth + 2, Math.max(3, laneHeight));
+          }
+          if (active && laneHeight >= 5) {
+            ctx.fillStyle = '#0f380f';
+            ctx.font = '7px "Press Start 2P", monospace';
+            ctx.fillText(MotifApp.noteName(event.pitch), x + 3, y + laneHeight / 2);
+          }
         }
       }
     }
 
+    for (const item of analysis?.events ?? []) {
+      if (item.status !== 'removed') continue;
+      if (item.time >= windowStart + windowSpan || item.time + item.duration <= windowStart) continue;
+      const x = labelWidth + ((item.time - windowStart) / windowSpan) * chartWidth;
+      const y = ((range.max - item.original_pitch) / laneCount) * pitchedHeight + 2;
+      const noteWidth = Math.max(2, (item.duration / windowSpan) * chartWidth - 1);
+      ctx.strokeStyle = 'rgba(224, 248, 208, 0.35)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 3]);
+      ctx.strokeRect(x, y, noteWidth, Math.max(2, laneHeight - 1));
+      ctx.setLineDash([]);
+    }
+
     // Playhead.
-    const playheadX = (2 / windowSpan) * width;
+    const playheadX = labelWidth + (2 / windowSpan) * chartWidth;
     ctx.strokeStyle = 'rgba(224, 248, 208, 0.8)';
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(playheadX, 0);
     ctx.lineTo(playheadX, height);
     ctx.stroke();
+
+    const uniqueActive = [...new Map(
+      activeNotes
+        .sort((a, b) => a.pitch - b.pitch)
+        .map(note => [`${note.role}:${note.pitch}`, note])
+    ).values()];
+    if (this.inspectedRollNote && !this.isMotifPlaying) {
+      const { role, event } = this.inspectedRollNote;
+      const voice = MotifApp.VOICE_LABELS[role] ?? role;
+      const diagnostic = analysis?.events?.find(item =>
+        item.status !== 'removed'
+        && Math.abs(item.time - event.time) <= 0.06
+        && Math.abs(item.pitch - event.pitch) <= 1
+      );
+      this.liveNotes.textContent = `INSPECT: ${MotifApp.noteName(event.pitch)}`
+        + ` | MIDI ${event.pitch}`
+        + ` | ${voice}`
+        + ` | velocity ${Math.round(event.velocity * 100)}%`
+        + ` | starts ${event.time.toFixed(2)}s`
+        + ` | lasts ${event.duration.toFixed(2)}s`
+        + (diagnostic
+          ? ` | ${diagnostic.status.toUpperCase()}: ${diagnostic.reason ?? 'harmony check'}`
+          : '');
+    } else {
+      const currentChord = analysis?.chords?.find(chord => chord.start <= now && now < chord.end);
+      this.liveNotes.textContent = uniqueActive.length === 0
+      ? `NOW: -${currentChord ? ` | CHORD: ${currentChord.label}` : ''}`
+      : `NOW: ${uniqueActive.map(note => {
+        const voice = MotifApp.VOICE_LABELS[note.role] ?? note.role;
+        return `${MotifApp.noteName(note.pitch)} ${voice}`;
+      }).join('  |  ')}${currentChord ? ` | CHORD: ${currentChord.label}` : ''}`;
+    }
+  }
+
+  private handlePianoRollHover(pointer: MouseEvent): void {
+    if (this.isMotifPlaying || !this.pianoRollRange) {
+      this.pianoRoll.style.cursor = 'default';
+      return;
+    }
+
+    const canvas = this.pianoRoll;
+    const rect = canvas.getBoundingClientRect();
+    const x = pointer.clientX - rect.left;
+    const y = pointer.clientY - rect.top;
+    const width = canvas.clientWidth;
+    const height = canvas.clientHeight;
+    const labelWidth = 42;
+    const drumLaneHeight = 18;
+    const pitchedHeight = height - drumLaneHeight - 4;
+    const chartWidth = Math.max(1, width - labelWidth);
+    if (x < labelWidth || y < 0 || y > pitchedHeight) {
+      this.setInspectedRollNote(null);
+      return;
+    }
+
+    const now = this.motifResumeProgress * this.motifEngine.getDuration();
+    const windowStart = now - 2;
+    const windowSpan = 8;
+    const hoveredTime = windowStart + ((x - labelWidth) / chartWidth) * windowSpan;
+    const range = this.pianoRollRange;
+    const laneCount = Math.max(1, range.max - range.min);
+    const hoveredPitch = range.max - (y / pitchedHeight) * laneCount;
+    let best: { role: string; event: NoteEvent; distance: number } | null = null;
+
+    for (const voice of this.motifEngine.getVoiceEvents()) {
+      if (voice.role === 'percussion') continue;
+      for (const event of voice.events) {
+        if (event.time > hoveredTime) break;
+        if (hoveredTime > event.time + event.duration) continue;
+        const distance = Math.abs(event.pitch - hoveredPitch);
+        if (distance <= 0.8 && (!best || distance < best.distance)) {
+          best = { role: voice.role, event, distance };
+        }
+      }
+    }
+
+    this.setInspectedRollNote(best ? { role: best.role, event: best.event } : null);
+  }
+
+  private setInspectedRollNote(note: { role: string; event: NoteEvent } | null): void {
+    if (
+      this.inspectedRollNote?.role === note?.role
+      && this.inspectedRollNote?.event === note?.event
+    ) return;
+    this.inspectedRollNote = note;
+    this.pianoRoll.style.cursor = note ? 'pointer' : 'default';
+    this.drawPianoRoll();
+  }
+
+  private static noteName(pitch: number): string {
+    const names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+    return `${names[((pitch % 12) + 12) % 12]}${Math.floor(pitch / 12) - 1}`;
   }
 
   private renderVoiceMixer(): void {
@@ -994,9 +1134,8 @@ class MotifApp {
 
   private setupSectionLoop(): void {
     // Section times come from the original audio; rescale to the styled timeline.
-    const timeScale = styleTimeScale(this.getStylePreset());
     const sections = ((this.currentMIDI?.metadata?.sections as number[] | undefined) ?? [])
-      .map(time => time * timeScale);
+      .slice();
     const duration = this.motifEngine.getDuration();
     this.sectionLoopSelect.innerHTML = '';
     this.motifEngine.setLoopRegion(null);
@@ -1020,20 +1159,6 @@ class MotifApp {
     });
 
     this.sectionLoopRow.style.display = this.sectionLoopSelect.options.length > 1 ? 'flex' : 'none';
-  }
-
-  private getStylePreset(): StylePreset {
-    if (this.styleSelect.value === 'spooky') return 'spooky';
-    if (this.styleSelect.value === 'dance') return 'dance';
-    return 'normal';
-  }
-
-  private async handleStyleChange(): Promise<void> {
-    if (!this.hasGenerated || !this.currentMIDI) return;
-    // Regenerate from the untouched transcription in the new style.
-    this.handleMotifStop();
-    this.motifResumeProgress = 0;
-    await this.handleMotif();
   }
 
   private handleSectionLoopChange(): void {
@@ -1072,10 +1197,10 @@ class MotifApp {
         | 'expanded'
         | undefined;
       const rendered = await this.motifEngine.renderOffline(
-        applyStyle(this.currentMIDI.events, this.getStylePreset(), this.currentMIDI.metadata?.bpm),
-        arrangementMode === 'original' && !this.lightweightMode.checked ? 'passthrough' : 'procedural',
+        this.currentMIDI.events,
+        'procedural',
         44100,
-        { lightweightMode: this.lightweightMode.checked, arrangementMode }
+        { arrangementMode }
       );
       const name = `${this.sanitizeFileName(this.selectedTitle.textContent || 'wario-synth')}.wav`;
       this.triggerDownload(MotifApp.audioBufferToWavBlob(rendered), name);
@@ -1465,6 +1590,8 @@ class MotifApp {
       // Audio exclusivity
       this.stopPreview();
       await unlockAudio();
+      this.inspectedRollNote = null;
+      this.pianoRoll.style.cursor = 'default';
 
       this.motifEngine.setVolume(0.8);
       await this.motifEngine.play();

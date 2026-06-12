@@ -42,6 +42,7 @@ type AudioTranscriptionResult = {
   bpm?: number;
   bpmSource?: string;
   sections?: number[];
+  analysis?: Record<string, unknown>;
 };
 
 type TranscriptionJob = {
@@ -60,13 +61,17 @@ const transcriptionJobs = new Map<string, TranscriptionJob>();
 const TRANSCRIPTION_JOB_TTL_MS = 10 * 60 * 1000;
 // Source separation runs a second neural model on CPU; give it headroom.
 const TRANSCRIPTION_TIMEOUT_MS = 30 * 60 * 1000;
+const TRANSCRIPTION_CACHE_VERSION = 3;
 
 // Completed transcriptions are cached on disk: repeat requests for the same
 // source + settings come back instantly instead of recomputing for minutes.
 const transcriptionCacheDir = path.resolve(serverDir, '../cache/transcriptions');
 
 function transcriptionCacheKey(parts: Record<string, unknown>): string {
-  return crypto.createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+  return crypto.createHash('sha256').update(JSON.stringify({
+    version: TRANSCRIPTION_CACHE_VERSION,
+    ...parts,
+  })).digest('hex');
 }
 
 async function readCachedTranscription(key: string): Promise<AudioTranscriptionResult | null> {
@@ -145,6 +150,7 @@ async function completeTranscription(pending: PendingTranscription, error?: stri
       let bpm: number | undefined;
       let bpmSource: string | undefined;
       let sections: number[] | undefined;
+      let analysis: Record<string, unknown> | undefined;
       try {
         const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')) as {
           title?: unknown;
@@ -152,6 +158,7 @@ async function completeTranscription(pending: PendingTranscription, error?: stri
           bpm?: unknown;
           bpm_source?: unknown;
           sections?: unknown;
+          analysis?: unknown;
         };
         if (typeof metadata.title === 'string') title = metadata.title.slice(0, 300);
         if (typeof metadata.arrangement === 'string') arrangement = metadata.arrangement.slice(0, 50);
@@ -161,6 +168,9 @@ async function completeTranscription(pending: PendingTranscription, error?: stri
           sections = metadata.sections
             .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
             .slice(0, 50);
+        }
+        if (metadata.analysis && typeof metadata.analysis === 'object' && !Array.isArray(metadata.analysis)) {
+          analysis = metadata.analysis as Record<string, unknown>;
         }
       } catch {
         // Metadata is helpful but not required for playback.
@@ -172,6 +182,7 @@ async function completeTranscription(pending: PendingTranscription, error?: stri
         bpm,
         bpmSource,
         sections,
+        analysis,
       };
       job.status = 'done';
       job.percent = 100;
@@ -559,6 +570,16 @@ app.get('/api/audio/transcription/:jobId/result', (req, res) => {
   if (job.result.bpmSource) res.setHeader('X-Motif-Bpm-Source', job.result.bpmSource);
   if (job.result.sections?.length) res.setHeader('X-Motif-Sections', JSON.stringify(job.result.sections));
   res.send(job.result.midi);
+});
+
+app.get('/api/audio/transcription/:jobId/analysis', (req, res) => {
+  const job = transcriptionJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Transcription job not found.' });
+  if (job.status === 'error') return res.status(500).json({ error: job.error });
+  if (job.status !== 'done' || !job.result) {
+    return res.status(409).json({ error: 'Transcription is still running.' });
+  }
+  res.json(job.result.analysis ?? {});
 });
 
 app.post(

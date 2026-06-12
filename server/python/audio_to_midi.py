@@ -65,6 +65,45 @@ def report_progress(percent: int, label: str) -> None:
     print("PROGRESS " + json.dumps({"percent": percent, "label": label}), flush=True)
 
 
+# Neural models are cached so a long-lived worker process loads each one
+# once and reuses it across jobs.
+_MODEL_CACHE: dict = {}
+
+
+def get_basic_pitch_model():
+    if "basic_pitch" not in _MODEL_CACHE:
+        from basic_pitch import ICASSP_2022_MODEL_PATH
+        from basic_pitch.inference import Model
+
+        _MODEL_CACHE["basic_pitch"] = Model(ICASSP_2022_MODEL_PATH)
+    return _MODEL_CACHE["basic_pitch"]
+
+
+def get_demucs_model(device: str):
+    key = f"demucs:{device}"
+    if key not in _MODEL_CACHE:
+        from demucs.pretrained import get_model
+
+        model = get_model("htdemucs")
+        model.to(device)
+        model.eval()
+        _MODEL_CACHE[key] = model
+    return _MODEL_CACHE[key]
+
+
+def get_piano_transcriber(device: str, checkpoint: Path):
+    key = f"piano:{device}"
+    if key not in _MODEL_CACHE:
+        import torch
+        from piano_transcription_inference import PianoTranscription
+
+        _MODEL_CACHE[key] = PianoTranscription(
+            device=torch.device(device),
+            checkpoint_path=str(checkpoint),
+        )
+    return _MODEL_CACHE[key]
+
+
 def select_torch_device() -> str:
     """Use the GPU when one is available — Demucs runs ~10x faster on CUDA."""
     try:
@@ -219,6 +258,7 @@ def transcribe_general(source: Path, output: Path, tempo_override: float | None 
     report_progress(45, "Listening for notes (the long part)")
     _, midi_data, note_events = predict(
         str(source),
+        model_or_model_path=get_basic_pitch_model(),
         onset_threshold=0.58,
         frame_threshold=0.35,
         minimum_note_length=90,
@@ -252,10 +292,7 @@ def transcribe_piano(source: Path, output: Path, tempo_override: float | None = 
         )
 
     audio, _ = librosa.load(str(source), sr=sample_rate, mono=True)
-    transcriber = PianoTranscription(
-        device=torch.device(select_torch_device()),
-        checkpoint_path=str(checkpoint),
-    )
+    transcriber = get_piano_transcriber(select_torch_device(), checkpoint)
     output.parent.mkdir(parents=True, exist_ok=True)
     report_progress(45, "Transcribing piano audio (the long part)")
     result = transcriber.transcribe(audio, str(output))
@@ -569,12 +606,9 @@ def separate_stems(source: Path, work_dir: Path) -> dict[str, Path]:
     import soundfile
     import torch
     from demucs.apply import apply_model
-    from demucs.pretrained import get_model
 
     device = select_torch_device()
-    model = get_model("htdemucs")
-    model.to(device)
-    model.eval()
+    model = get_demucs_model(device)
 
     audio, _ = librosa.load(str(source), sr=model.samplerate, mono=False)
     wav = torch.from_numpy(audio)
@@ -619,6 +653,7 @@ def transcribe_stem_notes(source: Path, minimum_frequency: float, maximum_freque
 
     _, midi_data, note_events = predict(
         str(source),
+        model_or_model_path=get_basic_pitch_model(),
         onset_threshold=0.55,
         frame_threshold=0.32,
         minimum_note_length=90,
@@ -707,8 +742,13 @@ def detect_drum_hits(source: Path):
         centroid = float(
             librosa.feature.spectral_centroid(y=window, sr=sample_rate).mean()
         )
-        # Low-centroid hits are kicks, bright ones are hats/snares.
-        pitch = 36 if centroid < 1800 else 42
+        # Kicks are dark, snares are broadband mids, hats are bright.
+        if centroid < 1200:
+            pitch = 36  # kick
+        elif centroid < 3500:
+            pitch = 38  # snare
+        else:
+            pitch = 42  # hat
         velocity = int(40 + (strength / peak_strength) * 70)
         hits.append((float(time), pitch, max(1, min(127, velocity))))
 
@@ -1212,7 +1252,7 @@ def arpeggiate_inner_voices(inner, tempo: float, scale=None):
     return result
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     source_group = parser.add_mutually_exclusive_group(required=True)
     source_group.add_argument("--input", type=Path)
@@ -1223,71 +1263,80 @@ def main() -> int:
     parser.add_argument("--bpm", type=float)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--metadata-output", type=Path)
-    args = parser.parse_args()
+    return parser
+
+
+def run_pipeline(args) -> None:
+    """Run one transcription job. Raises on failure; callers handle errors."""
     if args.bpm is not None and not 40 <= args.bpm <= 240:
-        parser.error("--bpm must be between 40 and 240")
+        raise ValueError("BPM must be between 40 and 240.")
 
-    try:
-        report_progress(2, "Starting up")
-        ffmpeg_path = find_ffmpeg()
-        with tempfile.TemporaryDirectory(prefix="motif-audio-") as temp:
-            work_dir = Path(temp)
-            if args.url:
-                report_progress(5, "Downloading audio from YouTube")
-                source, title = download_audio(args.url, work_dir, ffmpeg_path)
-                report_progress(20, "Audio downloaded")
-            else:
-                source = args.input.resolve()
-                if not source.is_file():
-                    raise FileNotFoundError(f"Audio file not found: {source}")
-                title = source.stem
+    report_progress(2, "Starting up")
+    ffmpeg_path = find_ffmpeg()
+    with tempfile.TemporaryDirectory(prefix="motif-audio-") as temp:
+        work_dir = Path(temp)
+        if args.url:
+            report_progress(5, "Downloading audio from YouTube")
+            source, title = download_audio(args.url, work_dir, ffmpeg_path)
+            report_progress(20, "Audio downloaded")
+        else:
+            source = args.input.resolve()
+            if not source.is_file():
+                raise FileNotFoundError(f"Audio file not found: {source}")
+            title = source.stem
 
-            report_progress(25, "Converting audio")
-            normalized = work_dir / "normalized.wav"
-            convert_to_wav(source, normalized, ffmpeg_path)
-            report_progress(30, "Analyzing tempo and sections")
-            detected_tempo, sections = analyze_audio_timing(normalized)
-            tempo = args.bpm
-            bpm_source = "manual" if tempo is not None else None
-            if tempo is None and detected_tempo is not None:
-                tempo = detected_tempo
-                bpm_source = "detected"
-            if args.separate:
-                transcribe_with_stems(normalized, args.output.resolve(), work_dir, tempo)
-                arrangement_value = "stems"
-            else:
-                transcribe(normalized, args.output.resolve(), args.mode, tempo)
-                arranged = False
-                if args.arrange in {"composer", "expanded"}:
-                    label = (
-                        "Applying expanded four-voice arrangement"
-                        if args.arrange == "expanded"
-                        else "Applying classic three-voice arrangement"
-                    )
-                    report_progress(94, label)
-                    arranged = apply_composer_arrangement(
-                        args.output.resolve(),
-                        expanded=args.arrange == "expanded",
-                        tempo_override=tempo,
-                    )
-                else:
-                    report_progress(94, "Preserving the transcription")
-                arrangement_value = args.arrange if arranged else "original"
-            report_progress(99, "Finishing")
-            if args.metadata_output:
-                args.metadata_output.resolve().write_text(
-                    json.dumps(
-                        {
-                            "title": title,
-                            "arrangement": arrangement_value,
-                            "bpm": tempo,
-                            "bpm_source": bpm_source,
-                            "sections": sections,
-                        },
-                        ensure_ascii=True,
-                    ),
-                    encoding="utf-8",
+        report_progress(25, "Converting audio")
+        normalized = work_dir / "normalized.wav"
+        convert_to_wav(source, normalized, ffmpeg_path)
+        report_progress(30, "Analyzing tempo and sections")
+        detected_tempo, sections = analyze_audio_timing(normalized)
+        tempo = args.bpm
+        bpm_source = "manual" if tempo is not None else None
+        if tempo is None and detected_tempo is not None:
+            tempo = detected_tempo
+            bpm_source = "detected"
+        if args.separate:
+            transcribe_with_stems(normalized, args.output.resolve(), work_dir, tempo)
+            arrangement_value = "stems"
+        else:
+            transcribe(normalized, args.output.resolve(), args.mode, tempo)
+            arranged = False
+            if args.arrange in {"composer", "expanded"}:
+                label = (
+                    "Applying expanded four-voice arrangement"
+                    if args.arrange == "expanded"
+                    else "Applying classic three-voice arrangement"
                 )
+                report_progress(94, label)
+                arranged = apply_composer_arrangement(
+                    args.output.resolve(),
+                    expanded=args.arrange == "expanded",
+                    tempo_override=tempo,
+                )
+            else:
+                report_progress(94, "Preserving the transcription")
+            arrangement_value = args.arrange if arranged else "original"
+        report_progress(99, "Finishing")
+        if args.metadata_output:
+            args.metadata_output.resolve().write_text(
+                json.dumps(
+                    {
+                        "title": title,
+                        "arrangement": arrangement_value,
+                        "bpm": tempo,
+                        "bpm_source": bpm_source,
+                        "sections": sections,
+                    },
+                    ensure_ascii=True,
+                ),
+                encoding="utf-8",
+            )
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        run_pipeline(args)
         return 0
     except Exception as error:
         print(str(error), file=sys.stderr)

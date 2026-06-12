@@ -1,4 +1,5 @@
 import { MotifEngine } from './core/MotifEngine';
+import { applyStyle, styleTimeScale, type StylePreset } from './core/StyleTransformer';
 import { MIDIService, type AudioTranscriptionProgress } from './services/MIDIService';
 import { MIDIParser } from './midi/MIDIParser';
 import { SoundfontMIDIPlayer } from './synthesis/SoundfontMIDIPlayer';
@@ -29,6 +30,7 @@ class MotifApp {
   private pianoRoll!: HTMLCanvasElement;
   private pianoRollFrame: number | null = null;
   private pianoRollRange: { min: number; max: number } | null = null;
+  private styleSelect!: HTMLSelectElement;
   private transcribeUrlBtn!: HTMLButtonElement;
   private audioFileInput!: HTMLInputElement;
   private chooseAudioBtn!: HTMLButtonElement;
@@ -138,6 +140,7 @@ class MotifApp {
     this.downloadMidiBtn = document.getElementById('downloadMidiBtn') as HTMLButtonElement;
     this.downloadWavBtn = document.getElementById('downloadWavBtn') as HTMLButtonElement;
     this.pianoRoll = document.getElementById('pianoRoll') as HTMLCanvasElement;
+    this.styleSelect = document.getElementById('styleSelect') as HTMLSelectElement;
     this.transcribeUrlBtn = document.getElementById('transcribeUrlBtn') as HTMLButtonElement;
     this.audioFileInput = document.getElementById('audioFileInput') as HTMLInputElement;
     this.chooseAudioBtn = document.getElementById('chooseAudioBtn') as HTMLButtonElement;
@@ -244,6 +247,7 @@ class MotifApp {
     this.downloadMidiBtn.addEventListener('click', () => this.handleDownloadMidi());
     this.downloadWavBtn.addEventListener('click', () => void this.handleDownloadWav());
     this.sectionLoopSelect.addEventListener('change', () => this.handleSectionLoopChange());
+    this.styleSelect.addEventListener('change', () => void this.handleStyleChange());
 
     // Embed snippet copy (may be disabled / not-live)
     this.copyEmbedBtn?.addEventListener('click', () => void this.copyEmbedSnippet());
@@ -749,8 +753,13 @@ class MotifApp {
         | 'composer'
         | 'expanded'
         | undefined;
-      await this.motifEngine.generateFromMIDI(
+      const styledEvents = applyStyle(
         this.currentMIDI.events,
+        this.getStylePreset(),
+        this.currentMIDI.metadata?.bpm
+      );
+      await this.motifEngine.generateFromMIDI(
+        styledEvents,
         arrangementMode === 'original' && !this.lightweightMode.checked
           ? 'passthrough'
           : 'procedural',
@@ -919,10 +928,11 @@ class MotifApp {
         const active = now >= event.time && now <= event.time + event.duration;
         ctx.fillStyle = active ? '#e0f8d0' : baseColor;
         if (isDrums) {
-          // Two thin lanes at the bottom: kicks low, hats high.
-          const lane = event.pitch <= 38 ? 1 : 0;
-          const y = height - drumLaneHeight + lane * (drumLaneHeight / 2) + 2;
-          ctx.fillRect(x, y, Math.max(2, Math.min(noteWidth, 4)), drumLaneHeight / 2 - 3);
+          // Three thin lanes at the bottom: hats, snares, kicks (top to bottom).
+          const lane = event.pitch <= 36 ? 2 : event.pitch <= 40 ? 1 : 0;
+          const laneSize = drumLaneHeight / 3;
+          const y = height - drumLaneHeight + lane * laneSize + 1;
+          ctx.fillRect(x, y, Math.max(2, Math.min(noteWidth, 4)), Math.max(2, laneSize - 2));
         } else {
           const y = ((range.max - event.pitch) / laneCount) * pitchedHeight + 2;
           ctx.fillRect(x, y, noteWidth, Math.max(2, laneHeight - 1));
@@ -983,7 +993,10 @@ class MotifApp {
   }
 
   private setupSectionLoop(): void {
-    const sections = (this.currentMIDI?.metadata?.sections as number[] | undefined) ?? [];
+    // Section times come from the original audio; rescale to the styled timeline.
+    const timeScale = styleTimeScale(this.getStylePreset());
+    const sections = ((this.currentMIDI?.metadata?.sections as number[] | undefined) ?? [])
+      .map(time => time * timeScale);
     const duration = this.motifEngine.getDuration();
     this.sectionLoopSelect.innerHTML = '';
     this.motifEngine.setLoopRegion(null);
@@ -1007,6 +1020,20 @@ class MotifApp {
     });
 
     this.sectionLoopRow.style.display = this.sectionLoopSelect.options.length > 1 ? 'flex' : 'none';
+  }
+
+  private getStylePreset(): StylePreset {
+    if (this.styleSelect.value === 'spooky') return 'spooky';
+    if (this.styleSelect.value === 'dance') return 'dance';
+    return 'normal';
+  }
+
+  private async handleStyleChange(): Promise<void> {
+    if (!this.hasGenerated || !this.currentMIDI) return;
+    // Regenerate from the untouched transcription in the new style.
+    this.handleMotifStop();
+    this.motifResumeProgress = 0;
+    await this.handleMotif();
   }
 
   private handleSectionLoopChange(): void {
@@ -1045,7 +1072,7 @@ class MotifApp {
         | 'expanded'
         | undefined;
       const rendered = await this.motifEngine.renderOffline(
-        this.currentMIDI.events,
+        applyStyle(this.currentMIDI.events, this.getStylePreset(), this.currentMIDI.metadata?.bpm),
         arrangementMode === 'original' && !this.lightweightMode.checked ? 'passthrough' : 'procedural',
         44100,
         { lightweightMode: this.lightweightMode.checked, arrangementMode }

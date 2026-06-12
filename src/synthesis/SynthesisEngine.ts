@@ -393,6 +393,24 @@ export class SynthesisEngine {
     return this.noiseBuffer;
   }
 
+  /** kick / snare / hat profiles for the noise channel. */
+  private static noiseHitProfile(pitch: number): {
+    filterType: BiquadFilterType;
+    frequency: number;
+    q: number;
+    decay: number;
+    gainScale: number;
+  } {
+    if (pitch <= 36) {
+      return { filterType: 'lowpass', frequency: 220, q: 1, decay: 0.14, gainScale: 0.9 };
+    }
+    if (pitch <= 40) {
+      // Snare: broadband mids, fuller and longer than a hat.
+      return { filterType: 'bandpass', frequency: 1900, q: 0.7, decay: 0.1, gainScale: 0.85 };
+    }
+    return { filterType: 'highpass', frequency: 5200, q: 1, decay: 0.05, gainScale: 0.5 };
+  }
+
   /** Game Boy noise channel: filtered white-noise bursts for drum hits. */
   private scheduleNoiseHit(layer: SynthLayer, pitch: number, velocity: number, when: number): void {
     const source = this.audioContext.createBufferSource();
@@ -400,17 +418,13 @@ export class SynthesisEngine {
 
     const hitFilter = this.audioContext.createBiquadFilter();
     const envelope = this.audioContext.createGain();
-    const isKick = pitch <= 38;
-    if (isKick) {
-      hitFilter.type = 'lowpass';
-      hitFilter.frequency.value = 220;
-    } else {
-      hitFilter.type = 'highpass';
-      hitFilter.frequency.value = 5200;
-    }
+    const profile = SynthesisEngine.noiseHitProfile(pitch);
+    hitFilter.type = profile.filterType;
+    hitFilter.frequency.value = profile.frequency;
+    hitFilter.Q.value = profile.q;
 
-    const decay = isKick ? 0.14 : 0.05;
-    const gainValue = velocity * (isKick ? 0.9 : 0.5);
+    const decay = profile.decay;
+    const gainValue = velocity * profile.gainScale;
     envelope.gain.setValueAtTime(gainValue, when);
     envelope.gain.exponentialRampToValueAtTime(0.001, when + decay);
 
@@ -842,12 +856,13 @@ export class SynthesisEngine {
 
     const hitFilter = ctx.createBiquadFilter();
     const envelope = ctx.createGain();
-    const isKick = pitch <= 38;
-    hitFilter.type = isKick ? 'lowpass' : 'highpass';
-    hitFilter.frequency.value = isKick ? 220 : 5200;
+    const profile = SynthesisEngine.noiseHitProfile(pitch);
+    hitFilter.type = profile.filterType;
+    hitFilter.frequency.value = profile.frequency;
+    hitFilter.Q.value = profile.q;
 
-    const decay = isKick ? 0.14 : 0.05;
-    const gainValue = velocity * (isKick ? 0.9 : 0.5);
+    const decay = profile.decay;
+    const gainValue = velocity * profile.gainScale;
     envelope.gain.setValueAtTime(gainValue, when);
     envelope.gain.exponentialRampToValueAtTime(0.001, when + decay);
 

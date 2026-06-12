@@ -32,8 +32,9 @@ and plays it through a homebrew Game Boy sound chip running in your browser.
   percussion. The Game Boy timbre without the hardware limits: full
   polyphony, every voice plays.
 - **Player extras** — a scrolling piano-roll visualizer in the original
-  Game Boy green palette, per-voice mute/volume mixer, loop-a-section mode,
-  live progress bar, transcription caching, and MIDI/WAV downloads.
+  Game Boy green palette, style presets (Normal / Spooky / Dance), per-voice
+  mute/volume mixer, loop-a-section mode, live progress bar, transcription
+  caching, and MIDI/WAV downloads.
 - **One-click Windows launcher** — `Start Wario Synth.bat` installs
   everything (Node deps, Python venv, the transcription models) and opens
   the app.

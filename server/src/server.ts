@@ -28,7 +28,7 @@ app.use(cors({
 app.use(express.json());
 
 const serverDir = path.dirname(fileURLToPath(import.meta.url));
-const audioScript = path.resolve(serverDir, '../python/audio_to_midi.py');
+const workerScript = path.resolve(serverDir, '../python/worker.py');
 const localPython = process.platform === 'win32'
   ? path.resolve(serverDir, '../.venv/Scripts/python.exe')
   : path.resolve(serverDir, '../.venv/bin/python');
@@ -123,46 +123,147 @@ function parseBpm(value: unknown): number | undefined {
   return bpm;
 }
 
-function startTranscriptionJob(
-  args: string[],
-  workDir: string,
-  titleOverride?: string,
-  cacheKey?: string
-): TranscriptionJob {
-  const id = crypto.randomUUID();
-  const midiPath = path.join(workDir, 'transcription.mid');
-  const metadataPath = path.join(workDir, 'metadata.json');
-  const job: TranscriptionJob = {
-    id,
-    status: 'running',
-    percent: 0,
-    label: 'Starting up',
-    titleOverride,
-    workDir,
-    createdAt: Date.now(),
-  };
-  transcriptionJobs.set(id, job);
+type PendingTranscription = {
+  job: TranscriptionJob;
+  args: string[];
+  midiPath: string;
+  metadataPath: string;
+  cacheKey?: string;
+};
 
-  const child = spawn(
-    pythonCommand,
-    [audioScript, ...args, '--output', midiPath, '--metadata-output', metadataPath],
-    { env: process.env, windowsHide: true }
-  );
+async function completeTranscription(pending: PendingTranscription, error?: string): Promise<void> {
+  const { job, midiPath, metadataPath, cacheKey } = pending;
+  if (error) {
+    job.status = 'error';
+    job.error = friendlyTranscriptionError(error);
+    console.error(`Transcription job ${job.id} failed:`, error);
+  } else {
+    try {
+      const midi = await fs.readFile(midiPath);
+      let title: string | undefined;
+      let arrangement: string | undefined;
+      let bpm: number | undefined;
+      let bpmSource: string | undefined;
+      let sections: number[] | undefined;
+      try {
+        const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')) as {
+          title?: unknown;
+          arrangement?: unknown;
+          bpm?: unknown;
+          bpm_source?: unknown;
+          sections?: unknown;
+        };
+        if (typeof metadata.title === 'string') title = metadata.title.slice(0, 300);
+        if (typeof metadata.arrangement === 'string') arrangement = metadata.arrangement.slice(0, 50);
+        if (typeof metadata.bpm === 'number' && Number.isFinite(metadata.bpm)) bpm = metadata.bpm;
+        if (typeof metadata.bpm_source === 'string') bpmSource = metadata.bpm_source.slice(0, 20);
+        if (Array.isArray(metadata.sections)) {
+          sections = metadata.sections
+            .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+            .slice(0, 50);
+        }
+      } catch {
+        // Metadata is helpful but not required for playback.
+      }
+      job.result = {
+        midi,
+        title: job.titleOverride ?? title,
+        arrangement,
+        bpm,
+        bpmSource,
+        sections,
+      };
+      job.status = 'done';
+      job.percent = 100;
+      job.label = 'Done';
+      if (cacheKey) await writeCachedTranscription(cacheKey, job.result);
+    } catch (readError) {
+      job.status = 'error';
+      job.error = 'Transcription finished but produced no MIDI file.';
+      console.error(`Transcription job ${job.id} output missing:`, readError);
+    }
+  }
+  await fs.rm(job.workDir, { recursive: true, force: true }).catch(() => {});
+  setTimeout(() => transcriptionJobs.delete(job.id), TRANSCRIPTION_JOB_TTL_MS).unref();
+}
 
-  let stderr = '';
-  let stdoutBuffer = '';
-  let timedOut = false;
-  let settled = false;
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    child.kill();
-  }, TRANSCRIPTION_TIMEOUT_MS);
+/**
+ * One long-lived Python worker. It pays the torch/librosa import cost once
+ * and keeps the neural models in memory, so each job after the first skips
+ * ~15 seconds of setup. Jobs run one at a time (they are resource-bound
+ * anyway); the worker is respawned if it crashes or times out.
+ */
+class TranscriptionWorker {
+  private child: ReturnType<typeof spawn> | null = null;
+  private queue: PendingTranscription[] = [];
+  private current: PendingTranscription | null = null;
+  private stdoutBuffer = '';
+  private stderrTail = '';
+  private jobTimeout: NodeJS.Timeout | null = null;
 
-  child.stdout.on('data', chunk => {
-    stdoutBuffer += String(chunk);
-    const lines = stdoutBuffer.split(/\r?\n/);
-    stdoutBuffer = lines.pop() ?? '';
+  submit(pending: PendingTranscription): void {
+    this.queue.push(pending);
+    this.pump();
+  }
+
+  private pump(): void {
+    if (this.current) return;
+    const next = this.queue.shift();
+    if (!next) return;
+    this.current = next;
+    this.stderrTail = '';
+    try {
+      this.ensureChild();
+      this.child!.stdin!.write(JSON.stringify({ args: next.args }) + '\n');
+    } catch (error) {
+      this.failCurrent(error instanceof Error ? error.message : 'Could not start the transcription worker.');
+      return;
+    }
+    this.jobTimeout = setTimeout(() => {
+      // The worker is stuck: kill it (close handler fails the job and respawns).
+      this.child?.kill();
+    }, TRANSCRIPTION_TIMEOUT_MS);
+  }
+
+  private ensureChild(): void {
+    if (this.child) return;
+    this.child = spawn(pythonCommand, [workerScript], {
+      env: process.env,
+      windowsHide: true,
+      cwd: path.dirname(workerScript),
+    });
+    this.stdoutBuffer = '';
+    this.child.stdout!.on('data', chunk => this.handleStdout(String(chunk)));
+    this.child.stderr!.on('data', chunk => {
+      this.stderrTail = (this.stderrTail + String(chunk)).slice(-4000);
+    });
+    this.child.on('error', error => this.handleExit(error.message));
+    this.child.on('close', () => this.handleExit());
+  }
+
+  private handleStdout(chunk: string): void {
+    this.stdoutBuffer += chunk;
+    const lines = this.stdoutBuffer.split(/\r?\n/);
+    this.stdoutBuffer = lines.pop() ?? '';
     for (const line of lines) {
+      const job = this.current?.job;
+
+      const resultMatch = line.match(/^RESULT (\{.*\})$/);
+      if (resultMatch) {
+        let ok = false;
+        let error: string | undefined;
+        try {
+          const result = JSON.parse(resultMatch[1]) as { ok?: unknown; error?: unknown };
+          ok = result.ok === true;
+          if (typeof result.error === 'string') error = result.error;
+        } catch {
+          error = 'The transcription worker returned an unreadable result.';
+        }
+        this.finishCurrent(ok ? undefined : (error || this.stderrTail.trim() || 'Transcription failed.'));
+        continue;
+      }
+
+      if (!job) continue;
       const progressMatch = line.match(/^PROGRESS (\{.*\})$/);
       if (progressMatch) {
         try {
@@ -185,78 +286,62 @@ function startTranscriptionJob(
         job.label = 'Transcribing piano audio';
       }
     }
-  });
-  child.stderr.on('data', chunk => {
-    stderr += String(chunk);
-  });
+  }
 
-  const finish = async (error?: string) => {
-    if (settled) return;
-    settled = true;
-    clearTimeout(timeout);
-    if (error) {
-      job.status = 'error';
-      job.error = friendlyTranscriptionError(error);
-      console.error(`Transcription job ${id} failed:`, error);
-    } else {
-      try {
-        const midi = await fs.readFile(midiPath);
-        let title: string | undefined;
-        let arrangement: string | undefined;
-        let bpm: number | undefined;
-        let bpmSource: string | undefined;
-        let sections: number[] | undefined;
-        try {
-          const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')) as {
-            title?: unknown;
-            arrangement?: unknown;
-            bpm?: unknown;
-            bpm_source?: unknown;
-            sections?: unknown;
-          };
-          if (typeof metadata.title === 'string') title = metadata.title.slice(0, 300);
-          if (typeof metadata.arrangement === 'string') arrangement = metadata.arrangement.slice(0, 50);
-          if (typeof metadata.bpm === 'number' && Number.isFinite(metadata.bpm)) bpm = metadata.bpm;
-          if (typeof metadata.bpm_source === 'string') bpmSource = metadata.bpm_source.slice(0, 20);
-          if (Array.isArray(metadata.sections)) {
-            sections = metadata.sections
-              .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
-              .slice(0, 50);
-          }
-        } catch {
-          // Metadata is helpful but not required for playback.
-        }
-        job.result = {
-          midi,
-          title: job.titleOverride ?? title,
-          arrangement,
-          bpm,
-          bpmSource,
-          sections,
-        };
-        job.status = 'done';
-        job.percent = 100;
-        job.label = 'Done';
-        if (cacheKey) await writeCachedTranscription(cacheKey, job.result);
-      } catch (readError) {
-        job.status = 'error';
-        job.error = 'Transcription finished but produced no MIDI file.';
-        console.error(`Transcription job ${id} output missing:`, readError);
-      }
+  private finishCurrent(error?: string): void {
+    if (this.jobTimeout) {
+      clearTimeout(this.jobTimeout);
+      this.jobTimeout = null;
     }
-    await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
-    setTimeout(() => transcriptionJobs.delete(id), TRANSCRIPTION_JOB_TTL_MS).unref();
+    const pending = this.current;
+    this.current = null;
+    if (pending) void completeTranscription(pending, error);
+    this.pump();
+  }
+
+  private failCurrent(error: string): void {
+    this.finishCurrent(error);
+  }
+
+  private handleExit(message?: string): void {
+    this.child = null;
+    if (this.current) {
+      const detail = message
+        || this.stderrTail.trim()
+        || 'The transcription worker stopped unexpectedly.';
+      this.failCurrent(detail);
+    }
+  }
+}
+
+const transcriptionWorker = new TranscriptionWorker();
+
+function startTranscriptionJob(
+  args: string[],
+  workDir: string,
+  titleOverride?: string,
+  cacheKey?: string
+): TranscriptionJob {
+  const id = crypto.randomUUID();
+  const midiPath = path.join(workDir, 'transcription.mid');
+  const metadataPath = path.join(workDir, 'metadata.json');
+  const job: TranscriptionJob = {
+    id,
+    status: 'running',
+    percent: 0,
+    label: 'Starting up',
+    titleOverride,
+    workDir,
+    createdAt: Date.now(),
   };
-
-  child.on('error', error => {
-    void finish(error.message);
+  transcriptionJobs.set(id, job);
+  transcriptionWorker.submit({
+    job,
+    args: [...args, '--output', midiPath, '--metadata-output', metadataPath],
+    midiPath,
+    metadataPath,
+    cacheKey,
   });
-  child.on('close', code => {
-    if (code === 0) void finish();
-    else if (timedOut) void finish('Transcription timed out after 15 minutes.');
-    else void finish(stderr.trim() || `Transcription exited with code ${code}.`);
-  });
-
   return job;
 }
 
